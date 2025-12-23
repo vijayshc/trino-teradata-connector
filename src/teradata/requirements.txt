@@ -1,0 +1,5 @@
+# Python Arrow Bridge Requirements
+# 
+# Install with: pip install -r requirements.txt
+
+pyarrow>=12.0.0
