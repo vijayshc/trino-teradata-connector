@@ -10,17 +10,23 @@ public class TrinoExportConnector implements Connector {
     private static final Logger log = Logger.get(TrinoExportConnector.class);
     private final TrinoExportSplitManager splitManager;
     private final TrinoExportFlightServer flightServer;
+    private final TeradataBridgeServer bridgeServer;
     private final TrinoExportMetadata metadata;
+    private final TrinoExportConfig config;
 
     @Inject
     public TrinoExportConnector(
             TrinoExportSplitManager splitManager,
             TrinoExportFlightServer flightServer,
-            TrinoExportMetadata metadata) {
+            TeradataBridgeServer bridgeServer,
+            TrinoExportMetadata metadata,
+            TrinoExportConfig config) {
         this.splitManager = splitManager;
         this.flightServer = flightServer;
+        this.bridgeServer = bridgeServer;
         this.metadata = metadata;
-        log.info("TrinoExportConnector instance created");
+        this.config = config;
+        log.info("TrinoExportConnector instance created with integrated Java bridge");
     }
 
     @Override
@@ -32,7 +38,7 @@ public class TrinoExportConnector implements Connector {
     public ConnectorPageSourceProvider getPageSourceProvider() {
         return (transaction, session, split, table, columns, dynamicFilter) -> {
             TrinoExportSplit exportSplit = (TrinoExportSplit) split;
-            return new TrinoExportPageSource(exportSplit.getQueryId(), columns);
+            return new TrinoExportPageSource(exportSplit.getQueryId(), columns, config.getTeradataTimezone());
         };
     }
 
@@ -50,9 +56,14 @@ public class TrinoExportConnector implements Connector {
     @Override
     public void shutdown() {
         try {
+            bridgeServer.close();
+        } catch (Exception e) {
+            log.warn("Error closing bridge server: %s", e.getMessage());
+        }
+        try {
             flightServer.close();
         } catch (Exception e) {
-            // Ignore shutdown errors
+            log.warn("Error closing flight server: %s", e.getMessage());
         }
     }
 }

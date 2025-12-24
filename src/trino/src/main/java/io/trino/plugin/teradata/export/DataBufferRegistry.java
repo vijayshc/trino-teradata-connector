@@ -13,19 +13,38 @@ import io.airlift.log.Logger;
  */
 public class DataBufferRegistry {
     private static final Logger log = Logger.get(DataBufferRegistry.class);
-    private static final Map<String, BlockingQueue<BatchContainer>> queryBuffers = new ConcurrentHashMap<>();
+    private static final Map<String, QueryBuffer> queryBuffers = new ConcurrentHashMap<>();
+
+    private static class QueryBuffer {
+        final BlockingQueue<BatchContainer> queue = new LinkedBlockingQueue<>(100);
+        final java.util.concurrent.atomic.AtomicInteger activeConnections = new java.util.concurrent.atomic.AtomicInteger(0);
+        volatile boolean jdbcFinished = false;
+        volatile boolean eosSignaled = false;
+
+        synchronized void checkAndSignalEos(String queryId) {
+            if (!eosSignaled && jdbcFinished && activeConnections.get() == 0) {
+                try {
+                    queue.put(BatchContainer.endOfStream());
+                    eosSignaled = true;
+                    log.info("Signaled end of stream for query %s", queryId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
 
     public static void registerQuery(String queryId) {
-        queryBuffers.putIfAbsent(queryId, new LinkedBlockingQueue<>(100));
+        queryBuffers.putIfAbsent(queryId, new QueryBuffer());
         log.info("Registered buffer for query %s", queryId);
     }
 
     public static void deregisterQuery(String queryId) {
-        BlockingQueue<BatchContainer> queue = queryBuffers.remove(queryId);
-        if (queue != null) {
-            log.info("Deregistering and clearing buffer for query %s. Remaining batches: %d", queryId, queue.size());
-            while (!queue.isEmpty()) {
-                BatchContainer container = queue.poll();
+        QueryBuffer buffer = queryBuffers.remove(queryId);
+        if (buffer != null) {
+            log.info("Deregistering and clearing buffer for query %s. Remaining batches: %d", queryId, buffer.queue.size());
+            while (!buffer.queue.isEmpty()) {
+                BatchContainer container = buffer.queue.poll();
                 if (container != null && !container.isEndOfStream()) {
                     try {
                         container.root().close();
@@ -38,32 +57,46 @@ public class DataBufferRegistry {
     }
 
     public static BlockingQueue<BatchContainer> getBuffer(String queryId) {
-        return queryBuffers.get(queryId);
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        return buffer != null ? buffer.queue : null;
+    }
+
+    public static void incrementConnections(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer != null) {
+            buffer.activeConnections.incrementAndGet();
+        }
+    }
+
+    public static void decrementConnections(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer != null) {
+            buffer.activeConnections.decrementAndGet();
+            buffer.checkAndSignalEos(queryId);
+        }
+    }
+
+    public static void signalJdbcFinished(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer != null) {
+            buffer.jdbcFinished = true;
+            log.info("JDBC execution finished for query %s", queryId);
+            buffer.checkAndSignalEos(queryId);
+        }
     }
 
     public static void pushData(String queryId, VectorSchemaRoot root) {
-        BlockingQueue<BatchContainer> queue = getBuffer(queryId);
-        if (queue != null) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer != null) {
             try {
                 log.info("Pushing batch with %d rows for query %s", root.getRowCount(), queryId);
-                queue.put(BatchContainer.of(root));
+                buffer.queue.put(BatchContainer.of(root));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         } else {
             log.warn("No buffer found for query %s", queryId);
-        }
-    }
-
-    public static void signalEndOfStream(String queryId) {
-        BlockingQueue<BatchContainer> queue = getBuffer(queryId);
-        if (queue != null) {
-            try {
-                log.info("Signaling end of stream for query %s", queryId);
-                queue.put(BatchContainer.endOfStream());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            root.close(); // Important to avoid memory leak
         }
     }
 }

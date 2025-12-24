@@ -53,7 +53,7 @@ public class TrinoExportFlightServer implements FlightProducer, AutoCloseable {
                 log.error(e, "Error in Arrow Flight acceptPut for query %s", queryId);
                 ackStream.onError(CallStatus.INTERNAL.withCause(e).toRuntimeException());
             } finally {
-                DataBufferRegistry.signalEndOfStream(queryId);
+                DataBufferRegistry.signalJdbcFinished(queryId);
             }
         };
     }

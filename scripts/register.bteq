@@ -1,30 +1,17 @@
--- =================================================================
--- register.bteq - Register the ExportToTrino Table Operator
--- =================================================================
--- 
--- Usage: bteq < register.bteq
--- 
--- Prerequisites:
---   1. Copy export_to_trino.c to a location accessible by Teradata
---   2. Update the connection credentials below
---   3. Update the source file path in the EXTERNAL NAME clause
--- =================================================================
+.LOGON 192.168.137.128/dbc,dbc
 
-.SET ERRORLEVEL 3807 SEVERITY 0
-.LOGON YOUR_TERADATA_HOST/your_user,your_password
-
--- Create or use existing database for the UDF
+-- Use our database
 DATABASE TrinoExport;
 
--- Grant CREATE FUNCTION permission if needed
-GRANT CREATE FUNCTION ON TrinoExport TO your_user;
+-- Grant CREATE FUNCTION permission
+GRANT CREATE FUNCTION ON TrinoExport TO dbc;
 
--- Drop existing function if it exists
+-- Drop any existing functions
 DROP FUNCTION ExportToTrino;
 DROP FUNCTION ExportToTrino_contract;
 
--- Register the Table Operator
--- NOTE: Update the path in EXTERNAL NAME to point to your source file location
+-- Register the Table Operator (single source file with both functions)
+-- The contract function is auto-discovered from the source file via USING FUNCTION clause
 REPLACE FUNCTION ExportToTrino()
 RETURNS TABLE VARYING USING FUNCTION ExportToTrino_contract
 SPECIFIC ExportToTrino
@@ -34,12 +21,9 @@ NO EXTERNAL DATA
 PARAMETER STYLE SQLTable
 NOT DETERMINISTIC
 CALLED ON NULL INPUT
-EXTERNAL NAME 'CS!ExportToTrino!/path/to/export_to_trino.c!F!ExportToTrino';
+EXTERNAL NAME 'CS!ExportToTrino!/home/vijay/tdconnector/src/teradata/export_to_trino.c!F!ExportToTrino';
 
--- Verify registration
-SELECT FunctionName, FunctionType, ParameterStyle 
-FROM DBC.FunctionsV 
-WHERE FunctionName LIKE 'Export%';
+-- Verify
+SELECT FunctionName, FunctionType, ParameterStyle FROM DBC.FunctionsV WHERE FunctionName LIKE 'Export%';
 
-.LOGOFF
 .QUIT

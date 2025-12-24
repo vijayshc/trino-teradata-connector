@@ -35,6 +35,7 @@ typedef struct {
     char bridge_host[256];
     int bridge_port;
     char query_id[256];
+    char security_token[256];
     int batch_size;
 } ExportParams_t;
 
@@ -144,7 +145,14 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
 
             if (c == 0) strcpy(target_ips, tmp);
             else if (c == 1) strcpy(params->query_id, tmp);
+            else if (c == 2) strcpy(params->security_token, tmp);
         }
+    }
+
+    /* Fallback for Security Token */
+    if (params->security_token[0] == '\0') {
+        char *env = getenv("EXPORT_SECURITY_TOKEN");
+        if (env) strcpy(params->security_token, env);
     }
 
     /* Fallback for Target IPs */
@@ -280,7 +288,18 @@ void ExportToTrino(void) {
         goto send_status;
     }
 
-    unsigned char ph[2048]; int ho = 0; int ql = strlen(params.query_id);
+    unsigned char ph[4096]; int ho = 0; 
+    
+    /* 1. Security Token (if configured) */
+    if (params.security_token[0] != '\0') {
+        int tl = strlen(params.security_token);
+        ho += write_uint32(ph + ho, tl);
+        memcpy(ph + ho, params.security_token, tl);
+        ho += tl;
+    }
+
+    /* 2. Query ID */
+    int ql = strlen(params.query_id);
     ho += write_uint32(ph + ho, ql); memcpy(ph+ho, params.query_id, ql); ho += ql;
     
     /* Allocate enough space for potentially large column metadata JSON */
@@ -341,7 +360,14 @@ void ExportToTrino(void) {
                     long long lv; memcpy(&lv, val, 8);
                     batch_offset += write_int64(bb + batch_offset, lv);
                 } else if (dt == TD_DATE) {
-                    int d = *(int*)val; char ds[16]; int l = sprintf(ds, "%04d-%02d-%02d", (d/10000)+1900, (d%10000)/100, d%100);
+                    int d = *(int*)val;
+                    int y_off = d / 10000;
+                    int md = d % 10000;
+                    if (md < 0) { y_off--; md += 10000; }
+                    int year = y_off + 1900;
+                    int month = md / 100;
+                    int day = md % 100;
+                    char ds[16]; int l = sprintf(ds, "%04d-%02d-%02d", year, month, day);
                     write_uint16(bb + batch_offset, (short)l); memcpy(bb + batch_offset + 2, ds, l); batch_offset += 2 + l;
                 } else if (dt == TD_TIME) {
                     unsigned int s_scaled; memcpy(&s_scaled, val, 4);
