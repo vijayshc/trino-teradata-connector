@@ -123,18 +123,17 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         String sampleClause = "";
         String orderByClause = "";
         
-        if (!tableHandle.hasAggregation()) {
-            // Only apply TOP/SAMPLE/ORDER BY for non-aggregation queries
-            if (tableHandle.isTopN()) {
-                // Top-N: ORDER BY ... LIMIT N -> SELECT TOP N ... ORDER BY ...
-                topClause = " TOP " + tableHandle.getLimit().getAsLong();
-                orderByClause = " ORDER BY " + TrinoExportTableHandle.SortItem.toSqlString(tableHandle.getSortOrder().get());
-                log.info("Using Top-N pushdown for query %s: TOP %d ORDER BY ...", splitId, tableHandle.getLimit().getAsLong());
-            } else if (tableHandle.getLimit().isPresent()) {
-                // Plain LIMIT without ORDER BY -> SAMPLE (random rows)
-                sampleClause = " SAMPLE " + tableHandle.getLimit().getAsLong();
-                log.info("Using SAMPLE pushdown for query %s: SAMPLE %d", splitId, tableHandle.getLimit().getAsLong());
-            }
+        // For Top-N queries: use "TOP N" with ORDER BY (sorted result)
+        // For plain LIMIT: use SAMPLE (random sampling, no sorting)
+        if (tableHandle.isTopN()) {
+            // Top-N: ORDER BY ... LIMIT N -> SELECT TOP N ... ORDER BY ...
+            topClause = " TOP " + tableHandle.getLimit().getAsLong();
+            orderByClause = " ORDER BY " + TrinoExportTableHandle.SortItem.toSqlString(tableHandle.getSortOrder().get());
+            log.info("Using Top-N pushdown for query %s: TOP %d ORDER BY ...", splitId, tableHandle.getLimit().getAsLong());
+        } else if (tableHandle.getLimit().isPresent()) {
+            // Plain LIMIT without ORDER BY -> SAMPLE (random rows)
+            sampleClause = " SAMPLE " + tableHandle.getLimit().getAsLong();
+            log.info("Using SAMPLE pushdown for query %s: SAMPLE %d", splitId, tableHandle.getLimit().getAsLong());
         }
         
         String schemaTable = tableHandle.getSchemaTableName().getSchemaName() + "." + 

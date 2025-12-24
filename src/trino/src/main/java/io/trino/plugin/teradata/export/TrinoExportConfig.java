@@ -30,6 +30,7 @@ public class TrinoExportConfig {
     private Duration dynamicFilterTimeout = new Duration(10, TimeUnit.SECONDS);
     private boolean enableDynamicFiltering = true;
     private boolean enableAggregationPushdown = true;
+    private boolean enableTopNPushdown = true;
 
     // === Security Settings ===
     private String securityToken;
@@ -233,6 +234,16 @@ public class TrinoExportConfig {
     @Config("teradata.export.enable-aggregation-pushdown")
     public TrinoExportConfig setEnableAggregationPushdown(boolean enableAggregationPushdown) {
         this.enableAggregationPushdown = enableAggregationPushdown;
+        return this;
+    }
+
+    public boolean isEnableTopNPushdown() {
+        return enableTopNPushdown;
+    }
+
+    @Config("teradata.export.enable-topn-pushdown")
+    public TrinoExportConfig setEnableTopNPushdown(boolean enableTopNPushdown) {
+        this.enableTopNPushdown = enableTopNPushdown;
         return this;
     }
 
