@@ -6,6 +6,7 @@ import io.trino.spi.NodeManager;
 import io.trino.spi.Node;
 
 import javax.inject.Inject;
+import java.net.InetAddress;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
@@ -56,7 +57,7 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         TrinoExportTableHandle tableHandle = (TrinoExportTableHandle) table;
         String baseQueryId = session.getQueryId();
         String trinoUser = session.getUser();
-        log.info("Generating splits for query %s, user: %s", baseQueryId, trinoUser);
+        log.info("Generating splits for query %s, user: %s, workers: %d", baseQueryId, trinoUser, workers.size());
         String tableName = tableHandle.getSchemaTableName().toString();
         
         // Create a unique split ID: queryId_tableHash_randomSuffix
@@ -64,25 +65,17 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         String randomSuffix = Long.toHexString(System.nanoTime() & 0xFFFFF);
         String splitId = baseQueryId + "_" + tableHash + "_" + randomSuffix;
         
-        DataBufferRegistry.registerQuery(splitId);
+        // Note: Don't register query here for multi-worker - let each worker's PageSource register
+        // DataBufferRegistry.registerQuery(splitId); 
 
-        // For multi-worker clusters: each worker should have its own bridge instance.
-        // We pass distinct worker IPs so Teradata AMPs can be distributed across them.
-        // In single-worker mode, we fall back to the configured address.
-        String allWorkerIps;
-        if (workers.size() > 1) {
-            // Multi-worker: use actual worker host addresses
-            allWorkerIps = workers.stream()
-                    .map(node -> node.getHost() + ":" + config.getBridgePort())
-                    .distinct()  // Remove duplicates if any
-                    .collect(Collectors.joining(","));
-        } else {
-            // Single-worker: use configured address (handles loopback issues)
-            allWorkerIps = config.getTrinoAddress() + ":" + config.getBridgePort();
-        }
+        // Build worker IPs for Teradata to connect to
+        // For multi-worker clusters: resolve hostnames to IPs for Teradata's inet_pton()
+        // For single-worker: use configured address (handles loopback/NAT issues)
+        String allWorkerIps = buildWorkerIpList(workers);
 
         log.info("Registering split %s for table %s (query %s). Worker IPs: %s", splitId, tableName, baseQueryId, allWorkerIps);
 
+        // Create splits - one per worker for parallel execution
         List<ConnectorSplit> splits = workers.stream()
                 .map(node -> new TrinoExportSplit(node.getHost(), splitId, allWorkerIps))
                 .collect(Collectors.toList());
@@ -91,6 +84,50 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         // This is critical for proper dynamic filter pushdown to Teradata
         return new TrinoExportDynamicFilteringSplitSource(
                 splits, dynamicFilter, tableHandle, splitId, allWorkerIps, session.getUser(), config, executor);
+    }
+    
+    /**
+     * Build comma-separated list of worker IP:port addresses for Teradata.
+     * 
+     * Priority:
+     * 1. If advertised-addresses is configured, use those (for NAT/multi-homed)
+     * 2. For multi-worker: resolve hostnames to IPs
+     * 3. For single-worker: use configured trino-address
+     */
+    private String buildWorkerIpList(List<Node> workers) {
+        // Check for explicitly configured advertised addresses (for NAT/multi-homed networks)
+        String advertisedAddresses = config.getWorkerAdvertisedAddresses();
+        if (advertisedAddresses != null && !advertisedAddresses.isEmpty()) {
+            log.info("Using configured advertised addresses: %s", advertisedAddresses);
+            return advertisedAddresses;
+        }
+        
+        if (workers.size() > 1) {
+            // Multi-worker: resolve hostnames to IPs for Teradata's inet_pton()
+            return workers.stream()
+                    .map(node -> resolveToIp(node.getHost()) + ":" + config.getBridgePort())
+                    .distinct()
+                    .collect(Collectors.joining(","));
+        } else {
+            // Single-worker: use configured address (handles loopback issues)
+            return config.getTrinoAddress() + ":" + config.getBridgePort();
+        }
+    }
+    
+    /**
+     * Resolve hostname to IP address for Teradata compatibility.
+     * Teradata C UDF uses inet_pton() which requires IP addresses, not hostnames.
+     */
+    private String resolveToIp(String host) {
+        try {
+            InetAddress addr = InetAddress.getByName(host);
+            String ip = addr.getHostAddress();
+            log.debug("Resolved %s -> %s", host, ip);
+            return ip;
+        } catch (Exception e) {
+            log.warn("Failed to resolve hostname %s, using as-is: %s", host, e.getMessage());
+            return host;
+        }
     }
 
     private void triggerTeradataExecution(String queryId, ConnectorTableHandle table, String targetIps, DynamicFilter dynamicFilter) {
@@ -174,8 +211,11 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         
         // Teradata Table Operator syntax with parameters passed via secondary DIMENSION stream
         // This is more robust than USING clause across different Teradata versions.
+        String udfDatabase = config.getUdfDatabase();
+        String udfName = config.getUdfName();
+        String fullUdfName = udfDatabase + "." + udfName;
         String sql = String.format(
-            "SELECT * FROM TrinoExport.ExportToTrino(" +
+            "SELECT * FROM " + fullUdfName + "(" +
             "  ON (SELECT %s FROM %s%s%s) " +
             "  ON (SELECT '%s' as target_ips, '%s' as qid) DIMENSION" +
             ") AS export_result", columnList, tableName, whereClause, sampleClause, targetIps, queryId);

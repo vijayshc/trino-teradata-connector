@@ -16,18 +16,20 @@ public class TrinoExportFlightServer implements FlightProducer, AutoCloseable {
     private final BufferAllocator allocator = new RootAllocator();
     private FlightServer server;
     private final int port;
+    private final String bindAddress;
 
     @Inject
     public TrinoExportFlightServer(TrinoExportConfig config) {
         this.port = config.getFlightPort();
+        this.bindAddress = config.getFlightBindAddress();
     }
 
     @PostConstruct
     public void start() throws IOException {
-        Location location = Location.forGrpcInsecure("0.0.0.0", port);
+        Location location = Location.forGrpcInsecure(bindAddress, port);
         this.server = FlightServer.builder(allocator, location, this).build();
         this.server.start();
-        log.info("Arrow Flight Server started on port %d", port);
+        log.info("Arrow Flight Server started on %s:%d", bindAddress, port);
     }
 
     @Override

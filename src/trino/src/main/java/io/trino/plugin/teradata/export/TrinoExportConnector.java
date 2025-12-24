@@ -26,7 +26,12 @@ public class TrinoExportConnector implements Connector {
         this.bridgeServer = bridgeServer;
         this.metadata = metadata;
         this.config = config;
-        log.info("TrinoExportConnector instance created with integrated Java bridge");
+        
+        // Initialize DataBufferRegistry with configured queue capacity
+        DataBufferRegistry.setBufferQueueCapacity(config.getBufferQueueCapacity());
+        
+        log.info("TrinoExportConnector initialized with: bufferQueueCapacity=%d, pagePollTimeout=%dms, debugLogging=%s",
+                config.getBufferQueueCapacity(), config.getPagePollTimeoutMs(), config.isEnableDebugLogging());
     }
 
     @Override
@@ -38,7 +43,12 @@ public class TrinoExportConnector implements Connector {
     public ConnectorPageSourceProvider getPageSourceProvider() {
         return (transaction, session, split, table, columns, dynamicFilter) -> {
             TrinoExportSplit exportSplit = (TrinoExportSplit) split;
-            return new TrinoExportPageSource(exportSplit.getQueryId(), columns, config.getTeradataTimezone());
+            return new TrinoExportPageSource(
+                    exportSplit.getQueryId(), 
+                    columns, 
+                    config.getTeradataTimezone(),
+                    config.getPagePollTimeoutMs(),
+                    config.isEnableDebugLogging());
         };
     }
 
@@ -55,6 +65,15 @@ public class TrinoExportConnector implements Connector {
 
     @Override
     public void shutdown() {
+        log.info("Shutting down TrinoExportConnector...");
+        
+        // Shutdown the DataBufferRegistry reaper thread and clean all buffers
+        try {
+            DataBufferRegistry.shutdown();
+        } catch (Exception e) {
+            log.warn("Error shutting down DataBufferRegistry: %s", e.getMessage());
+        }
+        
         try {
             bridgeServer.close();
         } catch (Exception e) {
@@ -65,5 +84,7 @@ public class TrinoExportConnector implements Connector {
         } catch (Exception e) {
             log.warn("Error closing flight server: %s", e.getMessage());
         }
+        
+        log.info("TrinoExportConnector shutdown complete");
     }
 }

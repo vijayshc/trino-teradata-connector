@@ -107,7 +107,8 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
 
     if (param_stream && FNC_TblOpRead(param_stream) == TBLOP_SUCCESS) {
         int c;
-        for (c = 0; c < 2; c++) {
+        for (c = 0; c < 3; c++) {
+            if (c >= FNC_TblOpGetColCount(1, ISINPUT)) break;
             void *val = param_stream->row->columnptr[c];
             if (TBLOPISNULL(param_stream->row->indicators, c)) continue;
             

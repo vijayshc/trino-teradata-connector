@@ -23,27 +23,16 @@ import java.util.concurrent.Executors;
 
 /**
  * High-performance Java Bridge Server that receives data directly from Teradata AMPs.
- * 
- * This eliminates the need for an external Python bridge process, providing:
- * - Zero-copy data transfer within the JVM
- * - Native Java NIO for high-throughput network I/O
- * - Direct Arrow buffer allocation in Trino's memory space
- * 
- * Protocol (from Teradata C UDF):
- * 1. Query ID: 4-byte length (big-endian) + UTF-8 string
- * 2. Schema JSON: 4-byte length (big-endian) + JSON string
- * 3. Batches: 4-byte length (big-endian) + batch data (0 = end of stream)
- * 
- * Batch format:
- * - 4 bytes: row count
- * - For each row, for each column:
- *   - 1 byte: null indicator (1=null, 0=not null)
- *   - If not null: type-specific data
  */
 public class TeradataBridgeServer implements AutoCloseable {
     private static final Logger log = Logger.get(TeradataBridgeServer.class);
     
+    // Magic number for control messages
+    public static final int CONTROL_MAGIC = 0xFEEDFACE;
+    
     private final int port;
+    private final int socketReceiveBufferSize;
+    private final int inputBufferSize;
     private final BufferAllocator allocator;
     private final ExecutorService executor;
     private ServerSocket serverSocket;
@@ -54,12 +43,17 @@ public class TeradataBridgeServer implements AutoCloseable {
     public TeradataBridgeServer(TrinoExportConfig config) {
         this.config = config;
         this.port = config.getBridgePort();
+        this.socketReceiveBufferSize = config.getSocketReceiveBufferSize();
+        this.inputBufferSize = config.getInputBufferSize();
         this.allocator = new RootAllocator();
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r, "teradata-bridge-handler");
             t.setDaemon(true);
             return t;
         });
+        
+        log.info("TeradataBridgeServer initialized with socketReceiveBufferSize=%d, inputBufferSize=%d",
+                socketReceiveBufferSize, inputBufferSize);
     }
 
     @PostConstruct
@@ -77,7 +71,7 @@ public class TeradataBridgeServer implements AutoCloseable {
                 try {
                     Socket clientSocket = serverSocket.accept();
                     clientSocket.setTcpNoDelay(true);
-                    clientSocket.setReceiveBufferSize(4 * 1024 * 1024); // 4MB receive buffer
+                    clientSocket.setReceiveBufferSize(socketReceiveBufferSize);
                     log.info("Connection from %s", clientSocket.getRemoteSocketAddress());
                     executor.submit(() -> handleClient(clientSocket));
                 } catch (IOException e) {
@@ -93,7 +87,8 @@ public class TeradataBridgeServer implements AutoCloseable {
 
     private void handleClient(Socket socket) {
         String queryId = "unknown";
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 1024 * 1024));
+        boolean incremented = false;
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), inputBufferSize));
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             
             // 1. Security Token Validation
@@ -104,23 +99,30 @@ public class TeradataBridgeServer implements AutoCloseable {
                 String receivedToken = new String(tokenBytes, StandardCharsets.UTF_8);
                 
                 if (!config.getSecurityToken().equals(receivedToken)) {
-                    log.error("Invalid security token from %s. Expected: %s, Received: %s", 
-                            socket.getRemoteSocketAddress(), config.getSecurityToken(), receivedToken);
-                    out.write("ERROR: UNATHORIZED".getBytes(StandardCharsets.UTF_8));
+                    log.error("Invalid security token from %s", socket.getRemoteSocketAddress());
+                    out.write("ERROR: UNAUTHORIZED".getBytes(StandardCharsets.UTF_8));
                     out.flush();
                     return;
                 }
             }
             
-            // 2. Read Query ID
-            int queryIdLen = in.readInt();
-            byte[] queryIdBytes = new byte[queryIdLen];
+            // 2. Read Magic Number or Query ID Length
+            int lenOrMagic = in.readInt();
+            
+            if (lenOrMagic == CONTROL_MAGIC) {
+                handleControlMessage(in, out);
+                return;
+            }
+            
+            // It's a normal Query ID
+            byte[] queryIdBytes = new byte[lenOrMagic];
             in.readFully(queryIdBytes);
             queryId = new String(queryIdBytes, StandardCharsets.UTF_8);
             log.info("Receiving data for query: %s", queryId);
 
             // Register this connection
             DataBufferRegistry.incrementConnections(queryId);
+            incremented = true;
             
             // Read Schema JSON
             int schemaLen = in.readInt();
@@ -128,83 +130,83 @@ public class TeradataBridgeServer implements AutoCloseable {
             in.readFully(schemaBytes);
             String schemaJson = new String(schemaBytes, StandardCharsets.UTF_8);
             
-            // Parse schema and create Arrow schema
             List<ColumnInfo> columns = parseSchema(schemaJson);
             Schema arrowSchema = createArrowSchema(columns);
             
             int totalRows = 0;
-            int batchCount = 0;
             
             // Read batches until end of stream
             while (true) {
                 int batchLen = in.readInt();
                 if (batchLen == 0) {
-                    log.info("End of stream for query %s", queryId);
+                    log.info("End of stream (marker) for query %s", queryId);
                     break;
                 }
                 
                 byte[] batchData = new byte[batchLen];
                 in.readFully(batchData);
                 
-                // Parse batch and create Arrow vectors
                 VectorSchemaRoot root = parseBatch(batchData, columns, arrowSchema);
                 totalRows += root.getRowCount();
-                batchCount++;
-                
-                // Push to DataBufferRegistry
                 DataBufferRegistry.pushData(queryId, root);
             }
             
-            // Send OK response
             out.write("OK".getBytes(StandardCharsets.UTF_8));
             out.flush();
-            
-            log.info("Successfully received %d rows in %d batches for query %s", totalRows, batchCount, queryId);
+            log.info("Successfully received %d rows for query %s", totalRows, queryId);
             
         } catch (Exception e) {
             log.error(e, "Error handling client for query %s", queryId);
         } finally {
-            // Decrement connection count - may trigger EOS if all connections done
-            DataBufferRegistry.decrementConnections(queryId);
+            if (incremented) {
+                DataBufferRegistry.decrementConnections(queryId);
+            }
             try {
                 socket.close();
             } catch (IOException ignored) {}
         }
     }
 
+    private void handleControlMessage(DataInputStream in, DataOutputStream out) throws IOException {
+        String queryId = "unknown";
+        try {
+            int qidLen = in.readInt();
+            byte[] qidBytes = new byte[qidLen];
+            in.readFully(qidBytes);
+            queryId = new String(qidBytes, StandardCharsets.UTF_8);
+            
+            int command = in.readInt();
+            if (command == 1) { // 1 = JDBC_FINISHED
+                log.info("Received Global EOS signal for query %s", queryId);
+                DataBufferRegistry.signalJdbcFinished(queryId);
+            }
+            
+            out.write("OK".getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        } catch (Exception e) {
+            log.error(e, "Error handling control message for query %s", queryId);
+        }
+    }
+
     private List<ColumnInfo> parseSchema(String json) {
-        // Simple JSON parsing for schema: {"columns":[{"name":"col_0","type":"VARCHAR"},...]}}
         List<ColumnInfo> columns = new ArrayList<>();
-        
         int columnsStart = json.indexOf("[");
         int columnsEnd = json.lastIndexOf("]");
-        if (columnsStart < 0 || columnsEnd < 0) {
-            return columns;
-        }
+        if (columnsStart < 0 || columnsEnd < 0) return columns;
         
         String columnsJson = json.substring(columnsStart + 1, columnsEnd);
-        
-        // Parse each column
         int pos = 0;
         while (pos < columnsJson.length()) {
             int objStart = columnsJson.indexOf("{", pos);
             if (objStart < 0) break;
             int objEnd = columnsJson.indexOf("}", objStart);
             if (objEnd < 0) break;
-            
             String colJson = columnsJson.substring(objStart, objEnd + 1);
-            
-            // Extract name
             String name = extractJsonString(colJson, "name");
             String type = extractJsonString(colJson, "type");
-            
-            if (name != null && type != null) {
-                columns.add(new ColumnInfo(name, type));
-            }
-            
+            if (name != null && type != null) columns.add(new ColumnInfo(name, type));
             pos = objEnd + 1;
         }
-        
         return columns;
     }
 
@@ -225,7 +227,7 @@ public class TeradataBridgeServer implements AutoCloseable {
                 case "INTEGER" -> new ArrowType.Int(32, true);
                 case "BIGINT" -> new ArrowType.Int(64, true);
                 case "DOUBLE" -> new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE);
-                default -> new ArrowType.Utf8(); // VARCHAR and others
+                default -> new ArrowType.Utf8();
             };
             fields.add(new Field(col.name, org.apache.arrow.vector.types.pojo.FieldType.nullable(type), null));
         }
@@ -234,61 +236,38 @@ public class TeradataBridgeServer implements AutoCloseable {
 
     private VectorSchemaRoot parseBatch(byte[] data, List<ColumnInfo> columns, Schema schema) {
         VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
-        
-        ByteBuffer buf = ByteBuffer.wrap(data);
-        int numRows = buf.getInt();
-        
-        // Allocate vectors
-        for (FieldVector vector : root.getFieldVectors()) {
-            vector.allocateNew();
-        }
-        
-        // Parse rows
-        for (int row = 0; row < numRows; row++) {
-            for (int col = 0; col < columns.size(); col++) {
-                FieldVector vector = root.getVector(col);
-                boolean isNull = buf.get() == 1;
-                
-                if (isNull) {
-                    setNull(vector, row);
-                } else {
-                    setValue(vector, row, buf, columns.get(col).type);
+        try {
+            ByteBuffer buf = ByteBuffer.wrap(data);
+            int numRows = buf.getInt();
+            for (FieldVector vector : root.getFieldVectors()) vector.allocateNew();
+            for (int row = 0; row < numRows; row++) {
+                for (int col = 0; col < columns.size(); col++) {
+                    FieldVector vector = root.getVector(col);
+                    if (buf.get() == 1) setNull(vector, row);
+                    else setValue(vector, row, buf, columns.get(col).type);
                 }
             }
+            root.setRowCount(numRows);
+            return root;
+        } catch (Exception e) {
+            root.close();
+            throw e;
         }
-        
-        root.setRowCount(numRows);
-        return root;
     }
 
     private void setNull(FieldVector vector, int row) {
-        if (vector instanceof IntVector iv) {
-            iv.setNull(row);
-        } else if (vector instanceof BigIntVector bv) {
-            bv.setNull(row);
-        } else if (vector instanceof Float8Vector fv) {
-            fv.setNull(row);
-        } else if (vector instanceof VarCharVector vv) {
-            vv.setNull(row);
-        }
+        if (vector instanceof IntVector iv) iv.setNull(row);
+        else if (vector instanceof BigIntVector bv) bv.setNull(row);
+        else if (vector instanceof Float8Vector fv) fv.setNull(row);
+        else if (vector instanceof VarCharVector vv) vv.setNull(row);
     }
 
     private void setValue(FieldVector vector, int row, ByteBuffer buf, String type) {
         switch (type) {
-            case "INTEGER" -> {
-                int val = buf.getInt();
-                ((IntVector) vector).setSafe(row, val);
-            }
-            case "BIGINT" -> {
-                long val = buf.getLong();
-                ((BigIntVector) vector).setSafe(row, val);
-            }
-            case "DOUBLE" -> {
-                double val = buf.getDouble();
-                ((Float8Vector) vector).setSafe(row, val);
-            }
+            case "INTEGER" -> ((IntVector) vector).setSafe(row, buf.getInt());
+            case "BIGINT" -> ((BigIntVector) vector).setSafe(row, buf.getLong());
+            case "DOUBLE" -> ((Float8Vector) vector).setSafe(row, buf.getDouble());
             default -> {
-                // VARCHAR - 2 bytes length + data
                 int len = buf.getShort() & 0xFFFF;
                 byte[] strBytes = new byte[len];
                 buf.get(strBytes);
@@ -302,9 +281,7 @@ public class TeradataBridgeServer implements AutoCloseable {
     public void close() {
         running = false;
         try {
-            if (serverSocket != null) {
-                serverSocket.close();
-            }
+            if (serverSocket != null) serverSocket.close();
         } catch (IOException ignored) {}
         executor.shutdownNow();
         allocator.close();

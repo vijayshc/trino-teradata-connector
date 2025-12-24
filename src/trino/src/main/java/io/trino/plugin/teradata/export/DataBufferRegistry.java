@@ -5,28 +5,92 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import io.airlift.log.Logger;
 
 /**
  * Global registry for buffering Arrow batches received from Teradata.
  * Each query has its own isolated buffer identified by QueryID.
+ * 
+ * IMPORTANT: This registry is static but per-JVM. In a multi-worker Trino cluster,
+ * each worker has its own isolated instance. The design ensures:
+ * 1. Each worker registers its own buffer when PageSource is created
+ * 2. Each worker receives data only from AMPs assigned to it
+ * 3. EOS is detected when all socket connections close AND JDBC is finished
  */
 public class DataBufferRegistry {
     private static final Logger log = Logger.get(DataBufferRegistry.class);
     private static final Map<String, QueryBuffer> queryBuffers = new ConcurrentHashMap<>();
+    private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "data-buffer-eos-scheduler");
+        t.setDaemon(true);
+        return t;
+    });
+    
+    // Configurable queue capacity (set from TrinoExportConfig during initialization)
+    private static int bufferQueueCapacity = 100;  // Default value
 
     private static class QueryBuffer {
-        final BlockingQueue<BatchContainer> queue = new LinkedBlockingQueue<>(100);
-        final java.util.concurrent.atomic.AtomicInteger activeConnections = new java.util.concurrent.atomic.AtomicInteger(0);
+        final BlockingQueue<BatchContainer> queue;
+        final AtomicInteger activeConnections = new AtomicInteger(0);
         volatile boolean jdbcFinished = false;
         volatile boolean eosSignaled = false;
+        final long createdAt = System.currentTimeMillis();
+        volatile long lastActivityTime = System.currentTimeMillis();
 
+        QueryBuffer(int capacity) {
+            this.queue = new LinkedBlockingQueue<>(capacity);
+        }
+
+        /**
+         * Update the last activity timestamp to prevent premature EOS.
+         */
+        void updateActivity() {
+            this.lastActivityTime = System.currentTimeMillis();
+        }
+
+        /**
+         * Check and signal end-of-stream.
+         * Logic: Signal EOS when all connections are done AND JDBC finished signal received
+         * AND a short stabilization period has passed since last activity.
+         */
         synchronized void checkAndSignalEos(String queryId) {
-            if (!eosSignaled && jdbcFinished && activeConnections.get() == 0) {
+            if (eosSignaled) return;
+            
+            if (jdbcFinished && activeConnections.get() == 0) {
+                long now = System.currentTimeMillis();
+                long idleTime = now - lastActivityTime;
+                
+                // Stabilization: wait at least 500ms after last activity or creation
+                // to ensure no sockets are in the OS accept queue or in-flight.
+                if (idleTime < 500) {
+                    log.debug("EOS check deferred for query %s (idle: %d ms). Scheduling retry.", queryId, idleTime);
+                    scheduler.schedule(() -> checkAndSignalEos(queryId), 500, TimeUnit.MILLISECONDS);
+                    return;
+                }
+
                 try {
                     queue.put(BatchContainer.endOfStream());
                     eosSignaled = true;
-                    log.info("Signaled end of stream for query %s", queryId);
+                    log.info("Signaled end of stream for query %s (confirmed: All sockets closed, JDBC finished, and idle > 500ms)", queryId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            } else {
+                log.debug("EOS check for query %s: jdbcFinished=%b, activeConnections=%d", 
+                        queryId, jdbcFinished, activeConnections.get());
+            }
+        }
+        
+        synchronized void forceSignalEos(String queryId) {
+            if (!eosSignaled) {
+                try {
+                    queue.put(BatchContainer.endOfStream());
+                    eosSignaled = true;
+                    log.info("Force signaled end of stream for query %s", queryId);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -34,9 +98,20 @@ public class DataBufferRegistry {
         }
     }
 
+    public static void setBufferQueueCapacity(int capacity) {
+        bufferQueueCapacity = capacity;
+        log.info("DataBufferRegistry queue capacity set to %d", capacity);
+    }
+
+    public static int getBufferQueueCapacity() {
+        return bufferQueueCapacity;
+    }
+
     public static void registerQuery(String queryId) {
-        queryBuffers.putIfAbsent(queryId, new QueryBuffer());
-        log.info("Registered buffer for query %s", queryId);
+        queryBuffers.computeIfAbsent(queryId, k -> {
+            log.info("Registered buffer for query %s (capacity: %d)", queryId, bufferQueueCapacity);
+            return new QueryBuffer(bufferQueueCapacity);
+        });
     }
 
     public static void deregisterQuery(String queryId) {
@@ -60,43 +135,62 @@ public class DataBufferRegistry {
         QueryBuffer buffer = queryBuffers.get(queryId);
         return buffer != null ? buffer.queue : null;
     }
+    
+    public static BlockingQueue<BatchContainer> getOrCreateBuffer(String queryId) {
+        registerQuery(queryId);
+        return getBuffer(queryId);
+    }
 
     public static void incrementConnections(String queryId) {
+        registerQuery(queryId);
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
-            buffer.activeConnections.incrementAndGet();
+            buffer.updateActivity();
+            int count = buffer.activeConnections.incrementAndGet();
+            log.debug("Incremented connections for query %s: now %d", queryId, count);
         }
     }
 
     public static void decrementConnections(String queryId) {
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
-            buffer.activeConnections.decrementAndGet();
+            int count = buffer.activeConnections.decrementAndGet();
+            log.debug("Decremented connections for query %s: now %d", queryId, count);
             buffer.checkAndSignalEos(queryId);
         }
     }
 
+    /**
+     * Mark that JDBC execution is finished globally.
+     * This may trigger EOS if all connections are already closed.
+     */
     public static void signalJdbcFinished(String queryId) {
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
+            log.info("JDBC execution finished signal received for query %s", queryId);
             buffer.jdbcFinished = true;
-            log.info("JDBC execution finished for query %s", queryId);
             buffer.checkAndSignalEos(queryId);
         }
     }
+    
+    public static boolean hasBuffer(String queryId) {
+        return queryBuffers.containsKey(queryId);
+    }
 
     public static void pushData(String queryId, VectorSchemaRoot root) {
+        registerQuery(queryId);
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
+            buffer.updateActivity();
             try {
-                log.info("Pushing batch with %d rows for query %s", root.getRowCount(), queryId);
+                log.debug("Pushing batch with %d rows for query %s", root.getRowCount(), queryId);
                 buffer.queue.put(BatchContainer.of(root));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                root.close();
             }
         } else {
-            log.warn("No buffer found for query %s", queryId);
-            root.close(); // Important to avoid memory leak
+            root.close();
         }
     }
 }

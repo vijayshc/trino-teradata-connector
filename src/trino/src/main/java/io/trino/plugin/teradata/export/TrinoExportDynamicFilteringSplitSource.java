@@ -1,11 +1,12 @@
 package io.trino.plugin.teradata.export;
 
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.log.Logger;
 import io.trino.spi.connector.*;
 import io.trino.spi.predicate.TupleDomain;
 
+import java.io.DataOutputStream;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -13,9 +14,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Custom SplitSource that waits for dynamic filter completion before returning splits.
- * This ensures that dynamic filter predicates are fully collected from the build side
- * of a JOIN before the probe side (Teradata) query is executed.
+ * Custom SplitSource that waits for dynamic filter completion before returning splits
+ * and broadcasts EOS signal after Teradata execution is done.
  */
 public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSource {
     private static final Logger log = Logger.get(TrinoExportDynamicFilteringSplitSource.class);
@@ -58,103 +58,63 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
             return CompletableFuture.completedFuture(new ConnectorSplitBatch(List.of(), true));
         }
 
-        // Check if dynamic filter is complete or if we should wait
         if (config.isEnableDynamicFiltering() && dynamicFilter != null && dynamicFilter.isAwaitable()) {
             if (!dynamicFilter.isComplete()) {
-                // Return a future that completes when the dynamic filter is ready
-                log.info("Waiting for dynamic filter before returning splits for query %s", splitId);
+                log.info("Waiting for dynamic filter for query %s", splitId);
                 CompletableFuture<?> blocked = dynamicFilter.isBlocked().toCompletableFuture();
-                return blocked.thenApply(v -> {
-                    // Re-check after waiting
-                    return createSplitBatchWithTeradataExecution();
-                });
+                return blocked.thenApply(v -> createSplitBatchWithTeradataExecution());
             }
         }
 
-        // Dynamic filter is complete (or not applicable), return splits now
         return CompletableFuture.completedFuture(createSplitBatchWithTeradataExecution());
     }
 
     private ConnectorSplitBatch createSplitBatchWithTeradataExecution() {
-        // Only start Teradata execution once
         if (teradataExecutionStarted.compareAndSet(false, true)) {
-            log.info("Dynamic filter ready, triggering Teradata execution for query %s", splitId);
-            executor.submit(() -> triggerTeradataExecution());
+            log.info("Triggering Teradata execution for query %s", splitId);
+            executor.submit(this::triggerTeradataExecution);
         }
-
         splitsReturned.set(true);
         return new ConnectorSplitBatch(splits, true);
     }
 
     private void triggerTeradataExecution() {
-        String tableName = tableHandle.getSchemaTableName().toString();
+        String columnList = tableHandle.getProjectedColumns()
+                .filter(c -> !c.isEmpty())
+                .map(c -> String.join(", ", c))
+                .orElse("*");
         
-        // Log dynamic filter state
-        if (dynamicFilter != null) {
-            log.info("Dynamic filter state for query %s: isComplete=%s, isAwaitable=%s, isAll=%s",
-                    splitId, dynamicFilter.isComplete(), dynamicFilter.isAwaitable(),
-                    dynamicFilter.getCurrentPredicate().isAll());
-        }
-
-        // Build column list for SELECT - use projected columns if available
-        // NOTE: The projected columns from applyProjection already contain the correct
-        // base column names (extracted from ColumnHandle.getName()), so we use them as-is.
-        String columnList;
-        if (tableHandle.getProjectedColumns().isPresent() && !tableHandle.getProjectedColumns().get().isEmpty()) {
-            columnList = String.join(", ", tableHandle.getProjectedColumns().get());
-            log.info("Using column pruning for query %s: %s", splitId, columnList);
-        } else {
-            columnList = "*";
-        }
-        
-        // Build WHERE clause
         List<String> predicateParts = new ArrayList<>();
-        
-        // 1. Static predicates from Metadata.applyFilter
         tableHandle.getPredicateClause().ifPresent(predicateParts::add);
         
-        // 2. Dynamic predicates from Trino's DynamicFilter
         if (config.isEnableDynamicFiltering() && dynamicFilter != null && !dynamicFilter.getCurrentPredicate().isAll()) {
             TupleDomain<ColumnHandle> dynamicPredicate = dynamicFilter.getCurrentPredicate();
-            log.info("Processing dynamic filter predicate for query %s: %s", splitId, dynamicPredicate);
-            
             dynamicPredicate.getDomains().ifPresent(domains -> {
                 for (java.util.Map.Entry<ColumnHandle, io.trino.spi.predicate.Domain> entry : domains.entrySet()) {
                     TrinoExportColumnHandle column = (TrinoExportColumnHandle) entry.getKey();
                     String sql = TrinoExportFilterUtils.domainToSql(column.getName(), column.getType(), entry.getValue());
-                    if (sql != null) {
-                        predicateParts.add(sql);
-                        log.info("Dynamic filter predicate for query %s: %s", splitId, sql);
-                    }
+                    if (sql != null) predicateParts.add(sql);
                 }
             });
         }
 
         String whereClause = predicateParts.isEmpty() ? "" : " WHERE " + String.join(" AND ", predicateParts);
-        if (!whereClause.isEmpty()) {
-            log.info("Final pushed down WHERE clause for query %s: %s", splitId, whereClause);
-        }
-
-        // Build SAMPLE clause from limit pushdown
-        String sampleClause = "";
-        if (tableHandle.getLimit().isPresent()) {
-            sampleClause = " SAMPLE " + tableHandle.getLimit().getAsLong();
-            log.info("Using limit pushdown for query %s: %s", splitId, sampleClause);
-        }
-
-        // Build the final Teradata SQL using the Table Operator
+        String sampleClause = tableHandle.getLimit().isPresent() ? " SAMPLE " + tableHandle.getLimit().getAsLong() : "";
+        
         String schemaTable = tableHandle.getSchemaTableName().getSchemaName() + "." + 
                              tableHandle.getSchemaTableName().getTableName();
         String innerQuery = "SELECT " + columnList + " FROM " + schemaTable + whereClause + sampleClause;
         
         String teradataSql;
+        String fullUdfName = config.getUdfDatabase() + "." + config.getUdfName();
+        
         if (config.getSecurityToken() != null && !config.getSecurityToken().isEmpty()) {
-            teradataSql = "SELECT * FROM TrinoExport.ExportToTrino(" +
+            teradataSql = "SELECT * FROM " + fullUdfName + "(" +
                     "  ON (" + innerQuery + ")" +
                     "   ON (SELECT '" + targetIps + "' as target_ips, '" + splitId + "' as qid, '" + config.getSecurityToken() + "' as token) DIMENSION" +
                     ") AS export_result";
         } else {
-            teradataSql = "SELECT * FROM TrinoExport.ExportToTrino(" +
+            teradataSql = "SELECT * FROM " + fullUdfName + "(" +
                     "  ON (" + innerQuery + ")" +
                     "   ON (SELECT '" + targetIps + "' as target_ips, '" + splitId + "' as qid) DIMENSION" +
                     ") AS export_result";
@@ -163,17 +123,59 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         log.info("Executing Teradata SQL for query %s: %s", splitId, teradataSql);
 
         try (java.sql.Connection conn = getConnection();
-             java.sql.Statement stmt = conn.createStatement()) {
-            java.sql.ResultSet rs = stmt.executeQuery(teradataSql);
-            while (rs.next()) {
-                // Process stats returned by the UDF
-            }
-            rs.close();
+             java.sql.Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery(teradataSql)) {
+            while (rs.next()) { }
             log.info("Teradata SQL execution finished successfully for query %s", splitId);
         } catch (Exception e) {
             log.error(e, "Error executing Teradata SQL for query %s", splitId);
         } finally {
             DataBufferRegistry.signalJdbcFinished(splitId);
+            broadcastJdbcFinishedSignal();
+        }
+    }
+
+    private void broadcastJdbcFinishedSignal() {
+        if (targetIps == null || targetIps.isEmpty()) return;
+        
+        String[] ips = targetIps.split(",");
+        for (String ipPort : ips) {
+            String target = ipPort.trim();
+            if (target.isEmpty()) continue;
+            
+            try {
+                String[] parts = target.split(":");
+                String host = parts[0];
+                int port = Integer.parseInt(parts[1]);
+                
+                log.info("Broadcasting Finished signal to worker %s for query %s", target, splitId);
+                try (Socket socket = new Socket(host, port);
+                     DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
+                    
+                    socket.setSoTimeout(5000);
+                    
+                    // 1. Token (if enabled)
+                    if (config.getSecurityToken() != null && !config.getSecurityToken().isEmpty()) {
+                        byte[] tokenBytes = config.getSecurityToken().getBytes(StandardCharsets.UTF_8);
+                        out.writeInt(tokenBytes.length);
+                        out.write(tokenBytes);
+                    }
+                    
+                    // 2. Control Magic
+                    out.writeInt(TeradataBridgeServer.CONTROL_MAGIC);
+                    
+                    // 3. Query ID
+                    byte[] qidBytes = splitId.getBytes(StandardCharsets.UTF_8);
+                    out.writeInt(qidBytes.length);
+                    out.write(qidBytes);
+                    
+                    // 4. Command (1 = JDBC_FINISHED)
+                    out.writeInt(1);
+                    out.flush();
+                }
+            } catch (Exception e) {
+                log.warn("Failed to broadcast Finished signal to worker %s: %s", target, e.getMessage());
+            }
         }
     }
 
@@ -185,28 +187,23 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         props.setProperty("password", config.getTeradataPassword());
         java.sql.Connection conn = driver.connect(config.getTeradataUrl(), props);
         
-        // Proxy Authentication: Set QUERY_BAND to identify the Trino user to Teradata
-        // This allow Teradata to perform authorization checks based on the Trino login user.
         if (trinoUser != null && !trinoUser.isEmpty()) {
             String qb = "PROXYUSER=" + trinoUser + ";";
-            log.info("Setting Teradata PROXYUSER for query %s: %s", splitId, trinoUser);
             try (java.sql.Statement stmt = conn.createStatement()) {
                 stmt.execute("SET QUERY_BAND = '" + qb + "' FOR SESSION;");
             } catch (java.sql.SQLException e) {
-                log.warn("Failed to set QUERY_BAND for query %s: %s", splitId, e.getMessage());
+                if (config.isEnforceProxyAuthentication()) {
+                    conn.close();
+                    throw new RuntimeException("Proxy authentication failed: " + e.getMessage(), e);
+                }
             }
         }
-        
         return conn;
     }
 
     @Override
-    public void close() {
-        closed.set(true);
-    }
+    public void close() { closed.set(true); }
 
     @Override
-    public boolean isFinished() {
-        return closed.get() || splitsReturned.get();
-    }
+    public boolean isFinished() { return closed.get() || splitsReturned.get(); }
 }

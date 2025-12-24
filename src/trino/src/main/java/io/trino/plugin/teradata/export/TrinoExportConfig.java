@@ -6,48 +6,48 @@ import io.airlift.units.Duration;
 import java.util.concurrent.TimeUnit;
 
 public class TrinoExportConfig {
-    private int flightPort = 50051;
+    // === Core Connection Settings ===
     private String teradataUrl;
     private String teradataUser;
     private String teradataPassword;
     private String passwordScript;
+    private String teradataTimezone = "-05:00";
+
+    // === Network/Port Settings ===
+    private int flightPort = 50051;
     private int bridgePort = 9999;
     private String trinoAddress = "172.27.251.157";
+    private String flightBindAddress = "0.0.0.0";
+    private String workerAdvertisedAddresses;  // For NAT/multi-homed networks
+
+    // === Buffer/Performance Settings ===
+    private int socketReceiveBufferSize = 4 * 1024 * 1024;  // 4MB
+    private int inputBufferSize = 1024 * 1024;              // 1MB
+    private int bufferQueueCapacity = 100;
+    private long pagePollTimeoutMs = 500;
+
+    // === Dynamic Filtering Settings ===
     private Duration dynamicFilterTimeout = new Duration(10, TimeUnit.SECONDS);
     private boolean enableDynamicFiltering = true;
-    private String teradataTimezone = "-05:00";
+
+    // === Security Settings ===
     private String securityToken;
     private String tokenScript;
+    private boolean enforceProxyAuthentication = true;
 
-    public int getBridgePort() {
-        return bridgePort;
-    }
+    // === UDF Settings ===
+    private String udfDatabase = "TrinoExport";
+    private String udfName = "ExportToTrino";
 
-    @Config("teradata.export.bridge-port")
-    public TrinoExportConfig setBridgePort(int bridgePort) {
-        this.bridgePort = bridgePort;
-        return this;
-    }
+    // === Schema Settings ===
+    private String defaultSchemas = "TrinoExport,default";
 
-    public String getTrinoAddress() {
-        return trinoAddress;
-    }
+    // === Logging Settings ===
+    private boolean enableDebugLogging = false;
 
-    @Config("teradata.export.trino-address")
-    public TrinoExportConfig setTrinoAddress(String trinoAddress) {
-        this.trinoAddress = trinoAddress;
-        return this;
-    }
-
-    public int getFlightPort() {
-        return flightPort;
-    }
-
-    @Config("teradata.export.flight-port")
-    public TrinoExportConfig setFlightPort(int flightPort) {
-        this.flightPort = flightPort;
-        return this;
-    }
+    // ============================================================
+    // Core Connection Getters/Setters
+    // ============================================================
 
     public String getTeradataUrl() {
         return teradataUrl;
@@ -93,6 +93,118 @@ public class TrinoExportConfig {
         return teradataPassword;
     }
 
+    public String getTeradataTimezone() {
+        return teradataTimezone;
+    }
+
+    @Config("teradata.timezone")
+    public TrinoExportConfig setTeradataTimezone(String teradataTimezone) {
+        this.teradataTimezone = teradataTimezone;
+        return this;
+    }
+
+    // ============================================================
+    // Network/Port Getters/Setters
+    // ============================================================
+
+    public int getFlightPort() {
+        return flightPort;
+    }
+
+    @Config("teradata.export.flight-port")
+    public TrinoExportConfig setFlightPort(int flightPort) {
+        this.flightPort = flightPort;
+        return this;
+    }
+
+    public int getBridgePort() {
+        return bridgePort;
+    }
+
+    @Config("teradata.export.bridge-port")
+    public TrinoExportConfig setBridgePort(int bridgePort) {
+        this.bridgePort = bridgePort;
+        return this;
+    }
+
+    public String getTrinoAddress() {
+        return trinoAddress;
+    }
+
+    @Config("teradata.export.trino-address")
+    public TrinoExportConfig setTrinoAddress(String trinoAddress) {
+        this.trinoAddress = trinoAddress;
+        return this;
+    }
+
+    public String getFlightBindAddress() {
+        return flightBindAddress;
+    }
+
+    @Config("teradata.export.flight-bind-address")
+    public TrinoExportConfig setFlightBindAddress(String flightBindAddress) {
+        this.flightBindAddress = flightBindAddress;
+        return this;
+    }
+
+    public String getWorkerAdvertisedAddresses() {
+        return workerAdvertisedAddresses;
+    }
+
+    @Config("teradata.export.worker-advertised-addresses")
+    public TrinoExportConfig setWorkerAdvertisedAddresses(String workerAdvertisedAddresses) {
+        this.workerAdvertisedAddresses = workerAdvertisedAddresses;
+        return this;
+    }
+
+    // ============================================================
+    // Buffer/Performance Getters/Setters
+    // ============================================================
+
+    public int getSocketReceiveBufferSize() {
+        return socketReceiveBufferSize;
+    }
+
+    @Config("teradata.export.socket-receive-buffer-size")
+    public TrinoExportConfig setSocketReceiveBufferSize(int socketReceiveBufferSize) {
+        this.socketReceiveBufferSize = socketReceiveBufferSize;
+        return this;
+    }
+
+    public int getInputBufferSize() {
+        return inputBufferSize;
+    }
+
+    @Config("teradata.export.input-buffer-size")
+    public TrinoExportConfig setInputBufferSize(int inputBufferSize) {
+        this.inputBufferSize = inputBufferSize;
+        return this;
+    }
+
+    public int getBufferQueueCapacity() {
+        return bufferQueueCapacity;
+    }
+
+    @Config("teradata.export.buffer-queue-capacity")
+    public TrinoExportConfig setBufferQueueCapacity(int bufferQueueCapacity) {
+        this.bufferQueueCapacity = bufferQueueCapacity;
+        return this;
+    }
+
+    public long getPagePollTimeoutMs() {
+        return pagePollTimeoutMs;
+    }
+
+    @Config("teradata.export.page-poll-timeout-ms")
+    public TrinoExportConfig setPagePollTimeoutMs(long pagePollTimeoutMs) {
+        this.pagePollTimeoutMs = pagePollTimeoutMs;
+        return this;
+    }
+
+    // ============================================================
+    // Dynamic Filtering Getters/Setters
+    // ============================================================
+
     public Duration getDynamicFilterTimeout() {
         return dynamicFilterTimeout;
     }
@@ -113,15 +225,9 @@ public class TrinoExportConfig {
         return this;
     }
 
-    public String getTeradataTimezone() {
-        return teradataTimezone;
-    }
-
-    @Config("teradata.timezone")
-    public TrinoExportConfig setTeradataTimezone(String teradataTimezone) {
-        this.teradataTimezone = teradataTimezone;
-        return this;
-    }
+    // ============================================================
+    // Security Getters/Setters
+    // ============================================================
 
     @Config("teradata.export.token")
     @ConfigSecuritySensitive
@@ -146,6 +252,79 @@ public class TrinoExportConfig {
         }
         return securityToken;
     }
+
+    public boolean isEnforceProxyAuthentication() {
+        return enforceProxyAuthentication;
+    }
+
+    @Config("teradata.export.enforce-proxy-authentication")
+    public TrinoExportConfig setEnforceProxyAuthentication(boolean enforceProxyAuthentication) {
+        this.enforceProxyAuthentication = enforceProxyAuthentication;
+        return this;
+    }
+
+    // ============================================================
+    // UDF Settings Getters/Setters
+    // ============================================================
+
+    public String getUdfDatabase() {
+        return udfDatabase;
+    }
+
+    @Config("teradata.export.udf-database")
+    public TrinoExportConfig setUdfDatabase(String udfDatabase) {
+        this.udfDatabase = udfDatabase;
+        return this;
+    }
+
+    public String getUdfName() {
+        return udfName;
+    }
+
+    @Config("teradata.export.udf-name")
+    public TrinoExportConfig setUdfName(String udfName) {
+        this.udfName = udfName;
+        return this;
+    }
+
+    // ============================================================
+    // Schema Settings Getters/Setters
+    // ============================================================
+
+    public String getDefaultSchemas() {
+        return defaultSchemas;
+    }
+
+    @Config("teradata.export.default-schemas")
+    public TrinoExportConfig setDefaultSchemas(String defaultSchemas) {
+        this.defaultSchemas = defaultSchemas;
+        return this;
+    }
+
+    public String[] getDefaultSchemasArray() {
+        if (defaultSchemas == null || defaultSchemas.isEmpty()) {
+            return new String[0];
+        }
+        return defaultSchemas.split(",");
+    }
+
+    // ============================================================
+    // Logging Settings Getters/Setters
+    // ============================================================
+
+    public boolean isEnableDebugLogging() {
+        return enableDebugLogging;
+    }
+
+    @Config("teradata.export.enable-debug-logging")
+    public TrinoExportConfig setEnableDebugLogging(boolean enableDebugLogging) {
+        this.enableDebugLogging = enableDebugLogging;
+        return this;
+    }
+
+    // ============================================================
+    // Utility Methods
+    // ============================================================
 
     private String executeScript(String scriptPath) {
         try {

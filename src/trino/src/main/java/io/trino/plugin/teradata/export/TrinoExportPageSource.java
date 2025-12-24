@@ -31,23 +31,33 @@ public class TrinoExportPageSource implements ConnectorPageSource {
     private final List<TrinoExportColumnHandle> columns;
     private final java.time.ZoneOffset teradataZoneOffset;
     private final java.time.ZoneOffset localZoneOffset;
+    private final long pagePollTimeoutMs;
+    private final boolean enableDebugLogging;
     private long completedBytes = 0;
     private boolean finished = false;
 
-    public TrinoExportPageSource(String queryId, List<ColumnHandle> columns, String teradataTimezone) {
+    public TrinoExportPageSource(String queryId, List<ColumnHandle> columns, String teradataTimezone, 
+                                  long pagePollTimeoutMs, boolean enableDebugLogging) {
         this.queryId = queryId;
+        
+        // CRITICAL: Register buffer on THIS worker (multi-worker support)
+        // Each worker needs its own buffer registration since DataBufferRegistry is per-JVM
+        DataBufferRegistry.registerQuery(queryId);
         this.buffer = DataBufferRegistry.getBuffer(queryId);
+        
         this.columns = columns.stream()
                 .map(TrinoExportColumnHandle.class::cast)
                 .collect(Collectors.toList());
+        this.pagePollTimeoutMs = pagePollTimeoutMs;
+        this.enableDebugLogging = enableDebugLogging;
         
         // Parse Teradata timezone offset
         this.teradataZoneOffset = java.time.ZoneOffset.of(teradataTimezone);
         // Get local timezone offset
         this.localZoneOffset = java.time.ZoneId.systemDefault().getRules().getOffset(java.time.Instant.now());
         
-        log.info("PageSource created for query %s with Teradata timezone %s, local timezone %s", 
-                queryId, teradataZoneOffset, localZoneOffset);
+        log.info("PageSource created for query %s on worker (buffer registered), pollTimeout=%dms", 
+                queryId, pagePollTimeoutMs);
     }
 
     @Override
@@ -72,7 +82,7 @@ public class TrinoExportPageSource implements ConnectorPageSource {
         }
 
         try {
-            BatchContainer container = buffer.poll(500, TimeUnit.MILLISECONDS);
+            BatchContainer container = buffer.poll(pagePollTimeoutMs, TimeUnit.MILLISECONDS);
             if (container == null) {
                 return null;
             }
@@ -200,7 +210,7 @@ public class TrinoExportPageSource implements ConnectorPageSource {
                         String strValue = value != null ? value.toString() : "";
                         
                         // Debug logging for type conversion issues
-                        if (j == 0) {
+                        if (j == 0 && enableDebugLogging) {
                             io.airlift.log.Logger.get(TrinoExportPageSource.class).info(
                                 "Column %s: Target type=%s, Vector type=%s, Value class=%s, Raw value='%s'",
                                 column.getName(), type, vector.getClass().getSimpleName(), 

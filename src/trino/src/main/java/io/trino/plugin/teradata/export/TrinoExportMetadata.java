@@ -50,11 +50,12 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
             log.error(e, "Error listing schema names from Teradata");
         }
         
-        if (!schemas.contains("TrinoExport")) {
-            schemas.add("TrinoExport");
-        }
-        if (!schemas.contains("default")) {
-            schemas.add("default");
+        // Add configurable default schemas
+        for (String defaultSchema : config.getDefaultSchemasArray()) {
+            String trimmed = defaultSchema.trim();
+            if (!trimmed.isEmpty() && !schemas.contains(trimmed)) {
+                schemas.add(trimmed);
+            }
         }
         log.info("Schemas found: %s", schemas);
         return schemas;

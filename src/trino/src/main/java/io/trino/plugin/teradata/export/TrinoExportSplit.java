@@ -8,6 +8,14 @@ import io.trino.spi.connector.ConnectorSplit;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Represents a split for the Teradata Export connector.
+ * 
+ * IMPORTANT for multi-worker setups:
+ * - Each split is assigned to a specific worker based on workerHost
+ * - isRemotelyAccessible() returns FALSE to enforce local execution
+ * - This ensures data sent to Worker N is processed by Worker N's PageSource
+ */
 public class TrinoExportSplit implements ConnectorSplit {
     private final String workerHost;
     private final String queryId;
@@ -38,9 +46,17 @@ public class TrinoExportSplit implements ConnectorSplit {
         return targetIps;
     }
 
+    /**
+     * CRITICAL: Return false to enforce split locality.
+     * This ensures the split runs on the worker specified by getAddresses(),
+     * which is where the corresponding Teradata AMPs will send data.
+     * 
+     * If this returns true, Trino optimizer might schedule the split on
+     * a different worker, causing data routing mismatch.
+     */
     @Override
     public boolean isRemotelyAccessible() {
-        return true;
+        return false;  // Enforce local execution for data locality
     }
 
     @Override
