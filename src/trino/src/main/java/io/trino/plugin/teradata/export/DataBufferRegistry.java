@@ -193,4 +193,13 @@ public class DataBufferRegistry {
             root.close();
         }
     }
+
+    public static void shutdown() {
+        log.info("Shutting down DataBufferRegistry...");
+        scheduler.shutdownNow();
+        for (String queryId : queryBuffers.keySet()) {
+            deregisterQuery(queryId);
+        }
+        queryBuffers.clear();
+    }
 }
