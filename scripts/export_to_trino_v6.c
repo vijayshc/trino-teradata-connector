@@ -1,0 +1,252 @@
+/**
+ * ExportToTrino - Teradata Table Operator with Socket-based Data Transfer
+ * 
+ * High-Performance Massively Parallel Data Export from Teradata to Trino
+ */
+
+#define SQL_TEXT Latin_Text
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include "sqltypes_td.h"
+
+#define SetError(e, m) strcpy((char *)sqlstate, (e)); strcpy((char *)error_message, (m))
+#define BATCH_SIZE 1000
+#define BUFFER_SIZE 2097152  /* 2MB buffer */
+
+typedef struct {
+    int colcount;
+    FNC_TblOpColumnDef_t *iCols;
+    FNC_TblOpHandle_t *Handle;
+} InputInfo_t;
+
+typedef struct {
+    char bridge_host[256];
+    int bridge_port;
+    char query_id[256];
+    int batch_size;
+} ExportParams_t;
+
+typedef struct {
+    INTEGER amp_id;
+    BIGINT rows_processed;
+    BIGINT bytes_sent;
+    BIGINT null_count;
+    BIGINT batches_sent;
+    int error_code;
+    char error_message[256];
+} ExportStats_t;
+
+/* Network Helpers */
+static int write_uint32(unsigned char *buf, unsigned int val) {
+    buf[0] = (val >> 24) & 0xFF; buf[1] = (val >> 16) & 0xFF;
+    buf[2] = (val >> 8) & 0xFF;  buf[3] = val & 0xFF;
+    return 4;
+}
+static int write_uint16(unsigned char *buf, unsigned short val) {
+    buf[0] = (val >> 8) & 0xFF; buf[1] = val & 0xFF;
+    return 2;
+}
+static int write_int32(unsigned char *buf, int val) {
+    buf[0] = (val >> 24) & 0xFF; buf[1] = (val >> 16) & 0xFF;
+    buf[2] = (val >> 8) & 0xFF;  buf[3] = val & 0xFF;
+    return 4;
+}
+static int write_int64(unsigned char *buf, long long val) {
+    buf[0] = (val >> 56) & 0xFF; buf[1] = (val >> 48) & 0xFF;
+    buf[2] = (val >> 40) & 0xFF; buf[3] = (val >> 32) & 0xFF;
+    buf[4] = (val >> 24) & 0xFF; buf[5] = (val >> 16) & 0xFF;
+    buf[6] = (val >> 8) & 0xFF;  buf[7] = val & 0xFF;
+    return 8;
+}
+
+static void parse_params(ExportParams_t *params) {
+    char *env_val;
+    strcpy(params->bridge_host, "172.27.251.157");
+    params->bridge_port = 9999;
+    strcpy(params->query_id, "default-query");
+    params->batch_size = BATCH_SIZE;
+    
+    if ((env_val = getenv("EXPORT_BRIDGE_HOST"))) strcpy(params->bridge_host, env_val);
+    if ((env_val = getenv("EXPORT_BRIDGE_PORT"))) params->bridge_port = atoi(env_val);
+    if ((env_val = getenv("EXPORT_QUERY_ID"))) strcpy(params->query_id, env_val);
+    if ((env_val = getenv("EXPORT_BATCH_SIZE"))) params->batch_size = atoi(env_val);
+}
+
+static int write_hex_string(unsigned char *buf, void *value, int bytesize) {
+    char hex[] = "0123456789ABCDEF";
+    unsigned char *p = (unsigned char*)value;
+    int len = bytesize * 2;
+    buf[0] = (len >> 8) & 0xFF; buf[1] = len & 0xFF;
+    for (int i = 0; i < bytesize; i++) {
+        buf[2 + i*2] = hex[(p[i] >> 4) & 0xF];
+        buf[2 + i*2 + 1] = hex[p[i] & 0xF];
+    }
+    return 2 + len;
+}
+
+static int write_decimal_as_string(unsigned char *buf, void *value, int bytesize, int scale) {
+    char str[100], tmp[64];
+    int len = 0, i = 0;
+    unsigned __int128 abs_val; __int128 val = 0;
+    if (bytesize == 1) val = *(__int8_t*)value;
+    else if (bytesize == 2) val = *(__int16_t*)value;
+    else if (bytesize == 4) val = *(__int32_t*)value;
+    else if (bytesize == 8) val = *(__int64_t*)value;
+    else if (bytesize >= 16) memcpy(&val, value, 16);
+    
+    if (val < 0) { str[len++] = '-'; abs_val = (unsigned __int128)(-val); } else abs_val = (unsigned __int128)val;
+    if (abs_val == 0) tmp[i++] = '0';
+    while (abs_val > 0) { tmp[i++] = (char)(abs_val % 10 + '0'); abs_val /= 10; }
+    while (i <= scale) tmp[i++] = '0';
+    for (int j = 0; j < i; j++) {
+        if (i - j == scale && scale > 0) str[len++] = '.';
+        str[len++] = tmp[i - 1 - j];
+    }
+    str[len] = '\0';
+    write_uint16(buf, (short)len); memcpy(buf + 2, str, len);
+    return 2 + len;
+}
+
+void ExportToTrino_contract(INTEGER *Result, int *indicator_Result, char sqlstate[6], SQL_TEXT extname[129], SQL_TEXT specific_name[129], SQL_TEXT error_message[257]) {
+    FNC_TblOpColumnDef_t *oCols;
+    int incount, outcount, i;
+    Stream_Fmt_en format = INDICFMT1;
+    char mycontract[] = "ExportToTrino v4.2";
+    FNC_TblOpGetStreamCount(&incount, &outcount);
+    if (incount == 0) { SetError("U0001", "Need input stream"); *Result = -1; return; }
+    oCols = (FNC_TblOpColumnDef_t *)FNC_malloc(TblOpSIZECOLDEF(7));
+    TblOpINITCOLDEF(oCols, 7);
+    oCols->num_columns = 7;
+    oCols->column_types[0].datatype = INTEGER_DT; oCols->column_types[0].bytesize = 4;
+    oCols->column_types[1].datatype = BIGINT_DT;  oCols->column_types[1].bytesize = 8;
+    oCols->column_types[2].datatype = BIGINT_DT;  oCols->column_types[2].bytesize = 8;
+    oCols->column_types[3].datatype = BIGINT_DT;  oCols->column_types[3].bytesize = 8;
+    oCols->column_types[4].datatype = BIGINT_DT;  oCols->column_types[4].bytesize = 8;
+    oCols->column_types[5].datatype = INTEGER_DT; oCols->column_types[5].bytesize = 4;
+    oCols->column_types[6].datatype = VARCHAR_DT; 
+    oCols->column_types[6].size.length = 256;
+    oCols->column_types[6].bytesize = 258;
+    oCols->column_types[6].charset = LATIN_CT;
+    FNC_TblOpSetContractDef(mycontract, strlen(mycontract) + 1);
+    FNC_TblOpSetOutputColDef(0, oCols);
+    for (i = 0; i < incount; i++) FNC_TblOpSetFormat("RECFMT", i, ISINPUT, &format, sizeof(format));
+    FNC_TblOpSetFormat("RECFMT", 0, ISOUTPUT, &format, sizeof(format));
+    FNC_free(oCols); *Result = 1; *indicator_Result = 0;
+}
+
+void ExportToTrino(
+    FNC_TblOpHandle_t *inHandle,
+    FNC_TblOpHandle_t *outHandle,
+    char sqlstate[6],
+    SQL_TEXT extname[129],
+    SQL_TEXT specific_name[129],
+    SQL_TEXT error_message[257])
+{
+    int incount, outcount, i, col, sock_fd = -1, batch_offset = 4, rows_in_batch = 0;
+    InputInfo_t *icolinfo;
+    ExportParams_t params;
+    ExportStats_t stats;
+    int total_input_cols = 0;
+    unsigned char *batch_buffer;
+    (void)extname; (void)specific_name; (void)sqlstate; (void)error_message;
+
+    memset(&stats, 0, sizeof(stats));
+    parse_params(&params);
+    FNC_TblOpGetStreamCount(&incount, &outcount);
+    icolinfo = (InputInfo_t *)FNC_malloc(incount * sizeof(InputInfo_t));
+    for (i = 0; i < incount; i++) {
+        icolinfo[i].colcount = FNC_TblOpGetColCount(i, ISINPUT);
+        total_input_cols += icolinfo[i].colcount;
+        icolinfo[i].iCols = (FNC_TblOpColumnDef_t *)FNC_malloc(TblOpSIZECOLDEF(icolinfo[i].colcount));
+        TblOpINITCOLDEF(icolinfo[i].iCols, icolinfo[i].colcount);
+        FNC_TblOpGetColDef(i, ISINPUT, icolinfo[i].iCols);
+    }
+    batch_buffer = (unsigned char *)FNC_malloc(BUFFER_SIZE);
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_port = htons(params.bridge_port);
+    inet_pton(AF_INET, params.bridge_host, &addr.sin_addr);
+    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        stats.error_code = errno; strcpy(stats.error_message, "Connect failed"); goto send_status;
+    }
+    /* Handshake + Schema */
+    unsigned char hdr[2048]; int ho = 0; int ql = strlen(params.query_id);
+    ho += write_uint32(hdr + ho, ql); memcpy(hdr+ho, params.query_id, ql); ho += ql;
+    char sj[8192]; strcpy(sj, "{\"columns\":[");
+    for (col = 0; col < icolinfo[0].colcount; col++) {
+        char cd[256]; const char *tn; int dt = icolinfo[0].iCols->column_types[col].datatype;
+        switch(dt) {
+            case INTEGER_DT: case 3: case 4: tn = "INTEGER"; break;
+            case BIGINT_DT: tn = "BIGINT"; break;
+            case REAL_DT: case 6: case 7: tn = "DOUBLE"; break;
+            default: tn = "VARCHAR"; break;
+        }
+        snprintf(cd, 256, "%s{\"name\":\"col_%d\",\"type\":\"%s\"}", col > 0 ? "," : "", col, tn); strcat(sj, cd);
+    }
+    strcat(sj, "]}"); ho += write_uint32(hdr + ho, strlen(sj));
+    send(sock_fd, hdr, ho, 0); send(sock_fd, sj, strlen(sj), 0);
+    /* Data Loop */
+    while (FNC_TblOpRead(inHandle) == TBLOP_SUCCESS) {
+        stats.rows_processed++; rows_in_batch++;
+        for (col = 0; col < icolinfo[0].colcount; col++) {
+            batch_buffer[batch_offset++] = TBLOPISNULL(inHandle->row->indicators, col) ? 1 : 0;
+            if (TBLOPISNULL(inHandle->row->indicators, col)) stats.null_count++;
+            else {
+                int dt = icolinfo[0].iCols->column_types[col].datatype;
+                void *val = inHandle->row->columnptr[col];
+                if (dt == INTEGER_DT) batch_offset += write_int32(batch_buffer + batch_offset, *(int*)val);
+                else if (dt == BIGINT_DT) batch_offset += write_int64(batch_buffer + batch_offset, *(long long*)val);
+                else if (dt == 3 || dt == 4) batch_offset += write_int32(batch_buffer + batch_offset, (int)(dt==3?*(short*)val:*(__int8_t*)val));
+                else if (dt == REAL_DT || dt == 6 || dt == 7) batch_offset += write_int64(batch_buffer + batch_offset, *(long long*)val);
+                else if (dt == VARCHAR_DT || dt == 22 || dt == 31) {
+                    short l = *(short*)val; batch_offset += write_uint16(batch_buffer + batch_offset, l);
+                    memcpy(batch_buffer + batch_offset, (char*)val + 2, l); batch_offset += l;
+                } else if (dt == CHAR_DT || dt == 30) {
+                    int l = icolinfo[0].iCols->column_types[col].bytesize; batch_offset += write_uint16(batch_buffer + batch_offset, (short)l);
+                    memcpy(batch_buffer + batch_offset, (char*)val, l); batch_offset += l;
+                } else if (dt == DATE_DT) {
+                    int d = *(int*)val; char ds[16]; int l = sprintf(ds, "%04d-%02d-%02d", (d/10000)+1900, (d%10000)/100, d%100);
+                    batch_offset += write_uint16(batch_buffer + batch_offset, (short)l); memcpy(batch_buffer + batch_offset, ds, l); batch_offset += l;
+                } else if (dt == 51) {
+                    double s = *(double*)val; char ts[32]; int l = sprintf(ts, "%02d:%02d:%09.6f", (int)(s/3600), (int)((s-((int)(s/3600))*3600)/60), s-((int)(s/3600))*3600-((int)((s-((int)(s/3600))*3600)/60))*60);
+                    batch_offset += write_uint16(batch_buffer + batch_offset, (short)l); memcpy(batch_buffer + batch_offset, ts, l); batch_offset += l;
+                } else if (dt >= 10 && dt <= 16) batch_offset += write_decimal_as_string(batch_buffer + batch_offset, val, icolinfo[0].iCols->column_types[col].bytesize, icolinfo[0].iCols->column_types[col].size.range.fracdigit);
+                else batch_offset += write_hex_string(batch_buffer + batch_offset, val, icolinfo[0].iCols->column_types[col].bytesize);
+            }
+        }
+        if (rows_in_batch >= params.batch_size || batch_offset > BUFFER_SIZE - 8192) {
+            write_uint32(batch_buffer, rows_in_batch); unsigned char lb[4]; write_uint32(lb, batch_offset);
+            send(sock_fd, lb, 4, 0); send(sock_fd, batch_buffer, batch_offset, 0);
+            stats.batches_sent++; batch_offset = 4; rows_in_batch = 0;
+        }
+    }
+    if (rows_in_batch > 0) {
+        write_uint32(batch_buffer, rows_in_batch); unsigned char lb[4]; write_uint32(lb, batch_offset);
+        send(sock_fd, lb, 4, 0); send(sock_fd, batch_buffer, batch_offset, 0); stats.batches_sent++;
+    }
+    unsigned char em[4] = {0,0,0,0}; send(sock_fd, em, 4, 0); char ak[4]; recv(sock_fd, ak, 2, 0);
+send_status:
+    if (sock_fd >= 0) close(sock_fd);
+    static INTEGER r_amp; static BIGINT r_rows, r_bytes, r_null, r_batch; static INTEGER r_cols; static char r_stat[260];
+    r_amp = 0; FNC_TblOpGetUniqID(&r_amp);
+    r_rows = stats.rows_processed; r_bytes = stats.bytes_sent; r_null = stats.null_count; r_batch = stats.batches_sent; r_cols = total_input_cols;
+    if (stats.error_code == 0) {
+        const char *rh = (strcmp(params.bridge_host, "localhost")==0 || strcmp(params.bridge_host, "127.0.0.1")==0) ? "127.0.0.1" : params.bridge_host;
+        int rp = (rh[0] == '1' && rh[1] == '2') ? 50051 : params.bridge_port;
+        snprintf(r_stat, 260, "[%s:%d] SUCCESS", rh, rp);
+    } else snprintf(r_stat, 260, "ERROR %d: %s", stats.error_code, stats.error_message);
+    short sl = strlen(r_stat);
+    outHandle->row->columnptr[0] = (void *)&r_amp; outHandle->row->columnptr[1] = (void *)&r_rows; outHandle->row->columnptr[2] = (void *)&r_bytes;
+    outHandle->row->columnptr[3] = (void *)&r_null; outHandle->row->columnptr[4] = (void *)&r_batch; outHandle->row->columnptr[5] = (void *)&r_cols;
+    outHandle->row->columnptr[6] = (void *)r_stat; outHandle->row->lengths[0] = 4; outHandle->row->lengths[1] = 8; outHandle->row->lengths[2] = 8;
+    outHandle->row->lengths[3] = 8; outHandle->row->lengths[4] = 8; outHandle->row->lengths[5] = 4; outHandle->row->lengths[6] = sl;
+    memset(outHandle->row->indicators, 0, 7); FNC_TblOpWrite(outHandle); FNC_TblOpClose(outHandle);
+    for (i = 0; i < incount; i++) { FNC_free(icolinfo[i].iCols); }
+    FNC_free(icolinfo); FNC_free(batch_buffer);
+}

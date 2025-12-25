@@ -1,7 +1,7 @@
 /* BTEQ Script to set up comprehensive test tables for Teradata-Trino connector validation */
 /* This creates tables covering all major Teradata data types */
 
-.LOGON 192.168.137.128/dbc,dbc;
+.LOGON 192.168.137.129/dbc,dbc;
 
 DATABASE TrinoExport;
 

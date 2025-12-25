@@ -11,6 +11,7 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
 import java.io.IOException;
@@ -173,6 +174,30 @@ public class TrinoExportPageSource implements ConnectorPageSource {
                         builder.appendNull();
                     } else {
                         type.writeLong(builder, bigIntVector.get(j));
+                    }
+                }
+                blocks[i] = builder.build();
+            } else if (type instanceof io.trino.spi.type.DateType && vector instanceof IntVector intVector) {
+                BlockBuilder builder = type.createBlockBuilder(null, rowCount);
+                for (int j = 0; j < rowCount; j++) {
+                    if (intVector.isNull(j)) builder.appendNull();
+                    else type.writeLong(builder, (long) intVector.get(j));
+                }
+                blocks[i] = builder.build();
+            } else if (type instanceof io.trino.spi.type.DecimalType decimalType && vector instanceof BigIntVector bigIntVector && decimalType.isShort()) {
+                BlockBuilder builder = type.createBlockBuilder(null, rowCount);
+                for (int j = 0; j < rowCount; j++) {
+                    if (bigIntVector.isNull(j)) builder.appendNull();
+                    else type.writeLong(builder, bigIntVector.get(j));
+                }
+                blocks[i] = builder.build();
+            } else if (type instanceof io.trino.spi.type.DecimalType decimalType && vector instanceof FixedSizeBinaryVector binaryVector && !decimalType.isShort()) {
+                BlockBuilder builder = type.createBlockBuilder(null, rowCount);
+                for (int j = 0; j < rowCount; j++) {
+                    if (binaryVector.isNull(j)) builder.appendNull();
+                    else {
+                        java.math.BigInteger unscaled = new java.math.BigInteger(reverse(binaryVector.get(j)));
+                        type.writeObject(builder, io.trino.spi.type.Int128.valueOf(unscaled));
                     }
                 }
                 blocks[i] = builder.build();
@@ -418,6 +443,14 @@ public class TrinoExportPageSource implements ConnectorPageSource {
             log.warn("Failed to parse time value '%s': %s, using midnight", value, e.getMessage());
             return java.time.LocalTime.MIDNIGHT;
         }
+    }
+
+    private byte[] reverse(byte[] bytes) {
+        byte[] reversed = new byte[bytes.length];
+        for (int i = 0; i < bytes.length; i++) {
+            reversed[i] = bytes[bytes.length - 1 - i];
+        }
+        return reversed;
     }
 
     @Override

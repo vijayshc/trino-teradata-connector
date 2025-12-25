@@ -1,7 +1,7 @@
 /* BTEQ Script to set up Dynamic Filtering Test Tables */
 /* Based on Trino dynamic filtering documentation examples */
 
-.LOGON 192.168.137.128/dbc,dbc;
+.LOGON 192.168.137.129/dbc,dbc;
 
 /* Create the test database if it doesn't exist */
 DATABASE TrinoExport;

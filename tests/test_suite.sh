@@ -32,7 +32,7 @@ NC='\033[0m'
 PROJECT_DIR=$(dirname "$(dirname "$(readlink -f "$0")")")
 
 # Configuration
-TD_HOST="${TD_HOST:-192.168.137.128}"
+TD_HOST="${TD_HOST:-192.168.137.129}"
 TD_USER="${TD_USER:-dbc}"
 TD_PASS="${TD_PASS:-dbc}"
 

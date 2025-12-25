@@ -1,4 +1,4 @@
-.LOGON 192.168.137.128/dbc,dbc
+.LOGON 192.168.137.129/dbc,dbc
 
 -- Use our database
 DATABASE TrinoExport;

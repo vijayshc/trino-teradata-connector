@@ -70,7 +70,7 @@ Teradata AMPs (128)                     Trino Workers (N)
 ### Connectivity Details
 | Component | Host/IP | Port | Credentials |
 | :--- | :--- | :--- | :--- |
-| **Teradata Database** | `192.168.137.128` | `1025` | `dbc` / `dbc` |
+| **Teradata Database** | `192.168.137.129` | `1025` | `dbc` / `dbc` |
 | **Trino Coordinator** | `localhost` | `8080` | N/A |
 | **Python Bridge (Listen)**| `0.0.0.0` | `9999` | N/A |
 | **Trino Flight Server** | `172.27.251.157` | `50051`| N/A |
@@ -191,7 +191,7 @@ bteq < scripts/register.bteq
 Useful for isolating UDF issues from Trino.
 ```bash
 bteq <<EOF
-.LOGON 192.168.137.128/dbc,dbc
+.LOGON 192.168.137.129/dbc,dbc
 DATABASE TrinoExport;
 SELECT * FROM ExportToTrino(
   ON (SELECT TOP 1 * FROM DBC.Tables)
@@ -351,7 +351,7 @@ The connector is highly configurable to support various enterprise environments.
 
 ```properties
 connector.name=teradata-export
-teradata.url=jdbc:teradata://192.168.137.128/DATABASE=TrinoExport
+teradata.url=jdbc:teradata://192.168.137.129/DATABASE=TrinoExport
 teradata.user=sysdba
 teradata.password=sysdba
 

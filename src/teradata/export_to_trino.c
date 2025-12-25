@@ -76,7 +76,16 @@ static int write_int64(unsigned char *buf, long long val) {
     return 8;
 }
 
-/* UTF-16LE to UTF-8 Conversion */
+/* Date/Time Helpers */
+static int ymd_to_epoch_days(int y, int m, int d) {
+    if (m <= 2) { y -= 1; m += 12; }
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m - 3) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int)doe - 719468;
+}
+
 static int write_unicode_to_utf8(unsigned char *buf, const unsigned char *val, int bytes) {
     int i = 0, j = 0;
     unsigned char *out = buf + 2;
@@ -317,6 +326,13 @@ void ExportToTrino(void) {
             case TD_INTEGER: case TD_SMALLINT: case TD_BYTEINT: tn = "INTEGER"; break;
             case TD_BIGINT: tn = "BIGINT"; break;
             case TD_FLOAT: tn = "DOUBLE"; break;
+            case TD_DATE: tn = "DATE"; break; /* Date is fine as binary */
+            case TD_TIME: tn = "VARCHAR"; break; /* Revert to string for now */
+            case TD_TIMESTAMP: tn = "VARCHAR"; break; /* Revert to string for now */
+            case TD_DECIMAL:
+                if (iCols->column_types[col].bytesize <= 8) tn = "DECIMAL_SHORT";
+                else tn = "DECIMAL_LONG";
+                break;
             default: tn = "VARCHAR"; break;
         }
         snprintf(cd, 256, "%s{\"name\":\"col_%d\",\"type\":\"%s\"}", col > 0 ? "," : "", col, tn); strcat(sj, cd);
@@ -368,8 +384,7 @@ void ExportToTrino(void) {
                     int year = y_off + 1900;
                     int month = md / 100;
                     int day = md % 100;
-                    char ds[16]; int l = sprintf(ds, "%04d-%02d-%02d", year, month, day);
-                    write_uint16(bb + batch_offset, (short)l); memcpy(bb + batch_offset + 2, ds, l); batch_offset += 2 + l;
+                    batch_offset += write_int32(bb + batch_offset, ymd_to_epoch_days(year, month, day));
                 } else if (dt == TD_TIME) {
                     unsigned int s_scaled; memcpy(&s_scaled, val, 4);
                     unsigned char hour = ((unsigned char*)val)[4], min = ((unsigned char*)val)[5];
@@ -379,12 +394,25 @@ void ExportToTrino(void) {
                 } else if (dt == TD_TIMESTAMP) {
                     unsigned int s_scaled; memcpy(&s_scaled, val, 4);
                     unsigned short year; memcpy(&year, (char*)val + 4, 2);
-                    unsigned char mon = ((unsigned char*)val)[6], day = ((unsigned char*)val)[7], hour = ((unsigned char*)val)[8], min = ((unsigned char*)val)[9];
+                    unsigned char mon = ((unsigned char*)val)[6], day = ((unsigned char*)val)[7], 
+                                  hour = ((unsigned char*)val)[8], min = ((unsigned char*)val)[9];
                     double sec = s_scaled / 1000000.0;
                     char tss[64]; int l = sprintf(tss, "%04d-%02d-%02d %02d:%02d:%09.6f", year, mon, day, hour, min, sec);
                     write_uint16(bb + batch_offset, (short)l); memcpy(bb + batch_offset + 2, tss, l); batch_offset += 2 + l;
                 } else if (dt == TD_DECIMAL) {
-                    batch_offset += write_decimal_as_string(bb + batch_offset, val, iCols->column_types[col].bytesize, iCols->column_types[col].size.range.fracdigit);
+                    int bsize = iCols->column_types[col].bytesize;
+                    if (bsize <= 8) {
+                        long long v = 0;
+                        if (bsize == 1) v = *(__int8_t*)val;
+                        else if (bsize == 2) v = *(__int16_t*)val;
+                        else if (bsize == 4) v = *(__int32_t*)val;
+                        else if (bsize == 8) v = *(long long*)val;
+                        batch_offset += write_int64(bb + batch_offset, v);
+                    } else {
+                        /* 16-byte decimal, send as raw bytes (Big Endian for consistency) */
+                        memcpy(bb + batch_offset, val, 16);
+                        batch_offset += 16;
+                    }
                 } else {
                     batch_offset += write_hex_string(bb + batch_offset, val, iCols->column_types[col].bytesize);
                 }

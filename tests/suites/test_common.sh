@@ -13,7 +13,7 @@ export MAGENTA='\033[0;35m'
 export NC='\033[0m'
 
 # Configuration
-export TD_HOST="${TD_HOST:-192.168.137.128}"
+export TD_HOST="${TD_HOST:-192.168.137.129}"
 export TD_USER="${TD_USER:-dbc}"
 export TD_PASS="${TD_PASS:-dbc}"
 export TD_HOME="${TD_HOME:-/opt/teradata/client/20.00}"

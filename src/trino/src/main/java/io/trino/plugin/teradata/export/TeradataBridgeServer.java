@@ -224,9 +224,10 @@ public class TeradataBridgeServer implements AutoCloseable {
         List<Field> fields = new ArrayList<>();
         for (ColumnInfo col : columns) {
             ArrowType type = switch (col.type) {
-                case "INTEGER" -> new ArrowType.Int(32, true);
-                case "BIGINT" -> new ArrowType.Int(64, true);
+                case "INTEGER", "DATE" -> new ArrowType.Int(32, true);
+                case "BIGINT", "DECIMAL_SHORT" -> new ArrowType.Int(64, true);
                 case "DOUBLE" -> new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE);
+                case "DECIMAL_LONG" -> new ArrowType.FixedSizeBinary(16);
                 default -> new ArrowType.Utf8();
             };
             fields.add(new Field(col.name, org.apache.arrow.vector.types.pojo.FieldType.nullable(type), null));
@@ -260,13 +261,19 @@ public class TeradataBridgeServer implements AutoCloseable {
         else if (vector instanceof BigIntVector bv) bv.setNull(row);
         else if (vector instanceof Float8Vector fv) fv.setNull(row);
         else if (vector instanceof VarCharVector vv) vv.setNull(row);
+        else if (vector instanceof FixedSizeBinaryVector fsv) fsv.setNull(row);
     }
 
     private void setValue(FieldVector vector, int row, ByteBuffer buf, String type) {
         switch (type) {
-            case "INTEGER" -> ((IntVector) vector).setSafe(row, buf.getInt());
-            case "BIGINT" -> ((BigIntVector) vector).setSafe(row, buf.getLong());
+            case "INTEGER", "DATE" -> ((IntVector) vector).setSafe(row, buf.getInt());
+            case "BIGINT", "TIME", "TIMESTAMP", "DECIMAL_SHORT" -> ((BigIntVector) vector).setSafe(row, buf.getLong());
             case "DOUBLE" -> ((Float8Vector) vector).setSafe(row, buf.getDouble());
+            case "DECIMAL_LONG" -> {
+                byte[] bytes = new byte[16];
+                buf.get(bytes);
+                ((FixedSizeBinaryVector) vector).setSafe(row, bytes);
+            }
             default -> {
                 int len = buf.getShort() & 0xFFFF;
                 byte[] strBytes = new byte[len];

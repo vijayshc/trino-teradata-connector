@@ -248,7 +248,7 @@ export EXPORT_BATCH_SIZE="10000"
 
 ```properties
 connector.name=teradata-export
-teradata.url=jdbc:teradata://192.168.137.128/DATABASE=TrinoExport
+teradata.url=jdbc:teradata://192.168.137.129/DATABASE=TrinoExport
 teradata.user=sysdba
 teradata.password=sysdba
 flight.port=50051
@@ -281,7 +281,7 @@ cd /home/vijay/tdconnector
 ### 7.3 Manual Test
 ```sql
 -- Connect via BTEQ
-.LOGON 192.168.137.128/dbc,dbc
+.LOGON 192.168.137.129/dbc,dbc
 DATABASE TrinoExport;
 
 -- Create test table
@@ -318,7 +318,7 @@ SELECT * FROM ExportToTrino(
 
 ```bash
 # SSH to Teradata server
-ssh root@192.168.137.128
+ssh root@192.168.137.129
 # Password: root
 
 # Check UDF compilation logs
@@ -410,8 +410,8 @@ TRINO_HOME=/opt/trino ./scripts/deploy_to_trino.sh
 
 | System | Host | User | Password |
 |--------|------|------|----------|
-| Teradata | 192.168.137.128 | dbc | dbc |
-| Teradata SSH | 192.168.137.128 | root | root |
+| Teradata | 192.168.137.129 | dbc | dbc |
+| Teradata SSH | 192.168.137.129 | root | root |
 | Trino | localhost:8080 | - | - |
 | Arrow Flight | :50051 | - | - |
 
