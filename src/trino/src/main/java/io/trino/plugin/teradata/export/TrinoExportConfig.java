@@ -21,13 +21,15 @@ public class TrinoExportConfig {
     private String workerAdvertisedAddresses;  // For NAT/multi-homed networks
 
     // === Buffer/Performance Settings ===
-    private int batchSize = 100000;
-    private int socketReceiveBufferSize = 64 * 1024 * 1024;  // 64MB
-    private int inputBufferSize = 8 * 1024 * 1024;           // 8MB
-    private int bufferQueueCapacity = 100;
-    private long pagePollTimeoutMs = 500;
-    private int splitsPerWorker = 4;
-    private boolean compressionEnabled = false;
+    // Option G: Increase Batch Size Dramatically
+    private int batchSize = 500000;  // 5x larger batches reduce per-batch overhead
+    private int socketReceiveBufferSize = 128 * 1024 * 1024;  // 128MB for high-bandwidth networks
+    private int inputBufferSize = 16 * 1024 * 1024;           // 16MB
+    private int bufferQueueCapacity = 500;  // Higher capacity for burst tolerance
+    private long pagePollTimeoutMs = 100;   // More aggressive polling
+    private int splitsPerWorker = 8;        // Match available CPU cores, not AMPs
+    private boolean compressionEnabled = true;  // Enable by default for max throughput
+
 
     // === Dynamic Filtering Settings ===
     private Duration dynamicFilterTimeout = new Duration(10, TimeUnit.SECONDS);

@@ -141,8 +141,11 @@ public class TeradataBridgeServer implements AutoCloseable {
             int totalRows = 0;
             long compressedBytes = 0;
             long decompressedBytes = 0;
+            
+            // Reusable buffer for decompression (Option E: Buffer Pooling)
             java.util.zip.Inflater inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
             byte[] decompressionBuffer = compressionEnabled ? new byte[64 * 1024 * 1024] : null;
+
 
             // Read batches until end of stream
             while (true) {
@@ -158,6 +161,7 @@ public class TeradataBridgeServer implements AutoCloseable {
                 
                 VectorSchemaRoot root;
                 if (compressionEnabled) {
+                    // Standard Java decompression with buffer reuse (Option E)
                     inflater.reset();
                     inflater.setInput(batchData);
                     int dLen = inflater.inflate(decompressionBuffer);
@@ -167,6 +171,7 @@ public class TeradataBridgeServer implements AutoCloseable {
                     decompressedBytes += batchLen;
                     root = parseBatch(batchData, batchLen, columns, arrowSchema);
                 }
+
                 
                 totalRows += root.getRowCount();
                 DataBufferRegistry.pushData(queryId, root);
@@ -177,6 +182,7 @@ public class TeradataBridgeServer implements AutoCloseable {
             double ratio = compressedBytes > 0 ? (double) decompressedBytes / compressedBytes : 1.0;
             log.info("Successfully received query %s: %d rows, %.2f MB compressed, %.2f MB decompressed (Ratio: %.2f:1)", 
                 queryId, totalRows, compressedBytes / (1024.0 * 1024.0), decompressedBytes / (1024.0 * 1024.0), ratio);
+
             
         } catch (Exception e) {
             log.error(e, "Error handling client for query %s", queryId);
