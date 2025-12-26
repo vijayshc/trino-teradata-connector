@@ -319,7 +319,6 @@ SELECT * FROM ExportToTrino(
 ```bash
 # SSH to Teradata server
 ssh root@192.168.137.129
-# Password: root
 
 # Check UDF compilation logs
 ls -la /var/opt/teradata/tdtemp/UDFTemp/
@@ -411,7 +410,6 @@ TRINO_HOME=/opt/trino ./scripts/deploy_to_trino.sh
 | System | Host | User | Password |
 |--------|------|------|----------|
 | Teradata | 192.168.137.129 | dbc | dbc |
-| Teradata SSH | 192.168.137.129 | root | root |
 | Trino | localhost:8080 | - | - |
 | Arrow Flight | :50051 | - | - |
 

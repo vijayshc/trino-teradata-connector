@@ -3,6 +3,7 @@
 # Configuration
 SOURCE_DIR="/home/vijay/tdconnector"
 TARGET_DIR="/home/vijay/tdconnector/opensource"
+PLUGIN_DIR="/home/vijay/tdconnector/trino_server/trino-server-479/plugin/teradata-export"
 
 echo "=== Syncing Project to Open Source Directory ==="
 
@@ -14,6 +15,7 @@ mkdir -p "$TARGET_DIR/config"
 mkdir -p "$TARGET_DIR/scripts"
 mkdir -p "$TARGET_DIR/tests"
 mkdir -p "$TARGET_DIR/target"
+mkdir -p "$TARGET_DIR/plugin/teradata-export"
 
 # 2. Copy Source Code
 echo "Syncing source code..."
@@ -45,6 +47,7 @@ echo "Syncing built artifact..."
 JAR_FILE=$(ls "$SOURCE_DIR/src/trino/target/trino-teradata-export-"*".jar" 2>/dev/null | head -n 1)
 if [ -n "$JAR_FILE" ]; then
     cp "$JAR_FILE" "$TARGET_DIR/target/trino-teradata-export.jar"
+    cp $PLUGIN_DIR/* $TARGET_DIR/plugin/teradata-export/
     echo "Copied JAR: $JAR_FILE"
 else
     echo "Warning: Built JAR not found in $SOURCE_DIR/src/trino/target/"
