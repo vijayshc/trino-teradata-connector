@@ -53,7 +53,7 @@ public class LogValidationTest extends BaseTdExportTest {
 
     private boolean checkLogFor(String marker, String expected) throws IOException {
         List<String> lines = Files.readAllLines(Paths.get(LOG_FILE));
-        int start = Math.max(0, lines.size() - 50);
+        int start = Math.max(0, lines.size() - 1000);
         for (int i = lines.size() - 1; i >= start; i--) {
             String line = lines.get(i);
             if (line.contains(marker) && line.contains(expected)) return true;

@@ -139,6 +139,8 @@ public class TeradataBridgeServer implements AutoCloseable {
             Schema arrowSchema = createArrowSchema(columns);
             
             int totalRows = 0;
+            long compressedBytes = 0;
+            long decompressedBytes = 0;
             java.util.zip.Inflater inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
             byte[] decompressionBuffer = compressionEnabled ? new byte[64 * 1024 * 1024] : null;
 
@@ -152,23 +154,29 @@ public class TeradataBridgeServer implements AutoCloseable {
                 
                 byte[] batchData = new byte[batchLen];
                 in.readFully(batchData);
+                compressedBytes += batchLen;
                 
-                byte[] processedData = batchData;
+                VectorSchemaRoot root;
                 if (compressionEnabled) {
                     inflater.reset();
                     inflater.setInput(batchData);
-                    int decompressedLen = inflater.inflate(decompressionBuffer);
-                    processedData = java.util.Arrays.copyOf(decompressionBuffer, decompressedLen);
+                    int dLen = inflater.inflate(decompressionBuffer);
+                    decompressedBytes += dLen;
+                    root = parseBatch(decompressionBuffer, dLen, columns, arrowSchema);
+                } else {
+                    decompressedBytes += batchLen;
+                    root = parseBatch(batchData, batchLen, columns, arrowSchema);
                 }
-
-                VectorSchemaRoot root = parseBatch(processedData, columns, arrowSchema);
+                
                 totalRows += root.getRowCount();
                 DataBufferRegistry.pushData(queryId, root);
             }
             
             out.write("OK".getBytes(StandardCharsets.UTF_8));
             out.flush();
-            log.info("Successfully received %d rows for query %s", totalRows, queryId);
+            double ratio = compressedBytes > 0 ? (double) decompressedBytes / compressedBytes : 1.0;
+            log.info("Successfully received query %s: %d rows, %.2f MB compressed, %.2f MB decompressed (Ratio: %.2f:1)", 
+                queryId, totalRows, compressedBytes / (1024.0 * 1024.0), decompressedBytes / (1024.0 * 1024.0), ratio);
             
         } catch (Exception e) {
             log.error(e, "Error handling client for query %s", queryId);
@@ -250,20 +258,28 @@ public class TeradataBridgeServer implements AutoCloseable {
         return new Schema(fields);
     }
 
-    private VectorSchemaRoot parseBatch(byte[] data, List<ColumnInfo> columns, Schema schema) {
+    private VectorSchemaRoot parseBatch(byte[] data, int length, List<ColumnInfo> columns, Schema schema) {
         VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
         try {
-            ByteBuffer buf = ByteBuffer.wrap(data);
+            int colCount = columns.size();
+            FieldVector[] vectors = new FieldVector[colCount];
+            String[] types = new String[colCount];
+            for (int i = 0; i < colCount; i++) {
+                vectors[i] = root.getVector(i);
+                vectors[i].allocateNew();
+                types[i] = columns.get(i).type;
+            }
+
+            ByteBuffer buf = ByteBuffer.wrap(data, 0, length);
             int numRows = buf.getInt();
-            for (FieldVector vector : root.getFieldVectors()) vector.allocateNew();
+            root.setRowCount(numRows);
+
             for (int row = 0; row < numRows; row++) {
-                for (int col = 0; col < columns.size(); col++) {
-                    FieldVector vector = root.getVector(col);
-                    if (buf.get() == 1) setNull(vector, row);
-                    else setValue(vector, row, buf, columns.get(col).type);
+                for (int col = 0; col < colCount; col++) {
+                    if (buf.get() == 1) setNull(vectors[col], row);
+                    else setValue(vectors[col], row, buf, types[col]);
                 }
             }
-            root.setRowCount(numRows);
             return root;
         } catch (Exception e) {
             root.close();
