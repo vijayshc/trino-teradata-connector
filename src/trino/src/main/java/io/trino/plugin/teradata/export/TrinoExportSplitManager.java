@@ -75,10 +75,14 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
 
         log.info("Registering split %s for table %s (query %s). Worker IPs: %s", splitId, tableName, baseQueryId, allWorkerIps);
 
-        // Create splits - one per worker for parallel execution
-        List<ConnectorSplit> splits = workers.stream()
-                .map(node -> new TrinoExportSplit(node.getHost(), splitId, allWorkerIps))
-                .collect(Collectors.toList());
+        // Create splits - multiple per worker for parallel consumption
+        List<ConnectorSplit> splits = new ArrayList<>();
+        int splitsPerWorker = config.getSplitsPerWorker();
+        for (Node node : workers) {
+            for (int i = 0; i < splitsPerWorker; i++) {
+                splits.add(new TrinoExportSplit(node.getHost(), splitId, allWorkerIps));
+            }
+        }
 
         // Use custom SplitSource that waits for dynamic filter completion
         // This is critical for proper dynamic filter pushdown to Teradata
@@ -217,8 +221,9 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         String sql = String.format(
             "SELECT * FROM " + fullUdfName + "(" +
             "  ON (SELECT %s FROM %s%s%s) " +
-            "  ON (SELECT '%s' as target_ips, '%s' as qid) DIMENSION" +
-            ") AS export_result", columnList, tableName, whereClause, sampleClause, targetIps, queryId);
+            "  ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size) DIMENSION" +
+            ") AS export_result", columnList, tableName, whereClause, sampleClause, 
+            targetIps, queryId, config.getSecurityToken() != null ? config.getSecurityToken() : "", config.getBatchSize());
 
         log.info("Executing Teradata SQL for query %s: %s", queryId, sql);
 

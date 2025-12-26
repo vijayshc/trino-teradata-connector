@@ -46,6 +46,9 @@ public class TrinoExportPageSource implements ConnectorPageSource {
         DataBufferRegistry.registerQuery(queryId);
         this.buffer = DataBufferRegistry.getBuffer(queryId);
         
+        // Register this instance as a consumer to support parallel split processing
+        DataBufferRegistry.incrementConsumers(queryId);
+        
         this.columns = columns.stream()
                 .map(TrinoExportColumnHandle.class::cast)
                 .collect(Collectors.toList());
@@ -89,14 +92,18 @@ public class TrinoExportPageSource implements ConnectorPageSource {
             }
 
             if (container.isEndOfStream()) {
-                io.airlift.log.Logger.get(TrinoExportPageSource.class).info("Received end of stream for query %s", queryId);
+                log.info("Received end of stream for query %s", queryId);
                 finished = true;
+                // Re-push the marker so other parallel consumers for the same query can also finish
+                DataBufferRegistry.pushEndMarker(queryId);
                 return null;
             }
 
             VectorSchemaRoot root = container.root();
             try {
-                io.airlift.log.Logger.get(TrinoExportPageSource.class).info("Converting batch with %d rows for query %s", root.getRowCount(), queryId);
+                if (enableDebugLogging) {
+                    log.info("Converting batch with %d rows for query %s", root.getRowCount(), queryId);
+                }
                 Page page = convertToPage(root);
                 completedBytes += page.getSizeInBytes();
                 return SourcePage.create(page);
@@ -182,6 +189,30 @@ public class TrinoExportPageSource implements ConnectorPageSource {
                 for (int j = 0; j < rowCount; j++) {
                     if (intVector.isNull(j)) builder.appendNull();
                     else type.writeLong(builder, (long) intVector.get(j));
+                }
+                blocks[i] = builder.build();
+            } else if (type instanceof io.trino.spi.type.TimeType && vector instanceof BigIntVector bigIntVector) {
+                // Binary conversion for TIME (picos since midnight)
+                BlockBuilder builder = type.createBlockBuilder(null, rowCount);
+                long offsetPicos = (long) teradataZoneOffset.getTotalSeconds() * 1_000_000_000_000L;
+                for (int j = 0; j < rowCount; j++) {
+                    if (bigIntVector.isNull(j)) builder.appendNull();
+                    else {
+                        long picos = bigIntVector.get(j) + offsetPicos;
+                        // Handle wrap-around for TIME
+                        if (picos < 0) picos += 86400_000_000_000_000L;
+                        else if (picos >= 86400_000_000_000_000L) picos -= 86400_000_000_000_000L;
+                        type.writeLong(builder, picos);
+                    }
+                }
+                blocks[i] = builder.build();
+            } else if (type instanceof io.trino.spi.type.TimestampType && vector instanceof BigIntVector bigIntVector) {
+                // Binary conversion for TIMESTAMP (micros since epoch)
+                BlockBuilder builder = type.createBlockBuilder(null, rowCount);
+                long offsetMicros = (long) teradataZoneOffset.getTotalSeconds() * 1_000_000L;
+                for (int j = 0; j < rowCount; j++) {
+                    if (bigIntVector.isNull(j)) builder.appendNull();
+                    else type.writeLong(builder, bigIntVector.get(j) + offsetMicros);
                 }
                 blocks[i] = builder.build();
             } else if (type instanceof io.trino.spi.type.DecimalType decimalType && vector instanceof BigIntVector bigIntVector && decimalType.isShort()) {

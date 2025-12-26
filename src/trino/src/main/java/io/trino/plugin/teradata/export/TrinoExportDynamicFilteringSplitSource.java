@@ -141,20 +141,13 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         String innerQuery = "SELECT" + topClause + " " + columnList + " FROM " + schemaTable + 
                            whereClause + groupByClause + orderByClause + sampleClause;
         
-        String teradataSql;
-        String fullUdfName = config.getUdfDatabase() + "." + config.getUdfName();
-        
-        if (config.getSecurityToken() != null && !config.getSecurityToken().isEmpty()) {
-            teradataSql = "SELECT * FROM " + fullUdfName + "(" +
-                    "  ON (" + innerQuery + ")" +
-                    "   ON (SELECT '" + targetIps + "' as target_ips, '" + splitId + "' as qid, '" + config.getSecurityToken() + "' as token) DIMENSION" +
-                    ") AS export_result";
-        } else {
-            teradataSql = "SELECT * FROM " + fullUdfName + "(" +
-                    "  ON (" + innerQuery + ")" +
-                    "   ON (SELECT '" + targetIps + "' as target_ips, '" + splitId + "' as qid) DIMENSION" +
-                    ") AS export_result";
-        }
+        String token = config.getSecurityToken() != null ? config.getSecurityToken() : "";
+        String teradataSql = String.format(
+                "SELECT * FROM %s.%s(" +
+                "  ON (%s)" +
+                "   ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size) DIMENSION" +
+                ") AS export_result", 
+                config.getUdfDatabase(), config.getUdfName(), innerQuery, targetIps, splitId, token, config.getBatchSize());
 
         log.info("Executing Teradata SQL for query %s: %s", splitId, teradataSql);
 

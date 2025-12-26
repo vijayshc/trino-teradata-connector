@@ -40,6 +40,7 @@ public class DataBufferRegistry {
         volatile boolean eosSignaled = false;
         final long createdAt = System.currentTimeMillis();
         volatile long lastActivityTime = System.currentTimeMillis();
+        final AtomicInteger activeConsumers = new AtomicInteger(0);
 
         QueryBuffer(int capacity) {
             this.queue = new LinkedBlockingQueue<>(capacity);
@@ -114,10 +115,24 @@ public class DataBufferRegistry {
         });
     }
 
-    public static void deregisterQuery(String queryId) {
-        QueryBuffer buffer = queryBuffers.remove(queryId);
+    public static void incrementConsumers(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
-            log.info("Deregistering and clearing buffer for query %s. Remaining batches: %d", queryId, buffer.queue.size());
+            buffer.activeConsumers.incrementAndGet();
+        }
+    }
+
+    public static void deregisterQuery(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer != null) {
+            int remaining = buffer.activeConsumers.decrementAndGet();
+            if (remaining > 0) {
+                log.debug("Consumer closed for query %s. %d consumers remaining.", queryId, remaining);
+                return;
+            }
+            
+            queryBuffers.remove(queryId);
+            log.info("Deregistering and clearing buffer for query %s. All consumers closed.", queryId);
             while (!buffer.queue.isEmpty()) {
                 BatchContainer container = buffer.queue.poll();
                 if (container != null && !container.isEndOfStream()) {
@@ -191,6 +206,17 @@ public class DataBufferRegistry {
             }
         } else {
             root.close();
+        }
+    }
+
+    public static void pushEndMarker(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer != null) {
+            try {
+                buffer.queue.put(BatchContainer.endOfStream());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

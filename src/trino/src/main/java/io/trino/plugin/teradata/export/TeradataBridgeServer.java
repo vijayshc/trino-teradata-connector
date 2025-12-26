@@ -225,7 +225,7 @@ public class TeradataBridgeServer implements AutoCloseable {
         for (ColumnInfo col : columns) {
             ArrowType type = switch (col.type) {
                 case "INTEGER", "DATE" -> new ArrowType.Int(32, true);
-                case "BIGINT", "DECIMAL_SHORT" -> new ArrowType.Int(64, true);
+                case "BIGINT", "TIME", "TIMESTAMP", "DECIMAL_SHORT" -> new ArrowType.Int(64, true);
                 case "DOUBLE" -> new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE);
                 case "DECIMAL_LONG" -> new ArrowType.FixedSizeBinary(16);
                 default -> new ArrowType.Utf8();

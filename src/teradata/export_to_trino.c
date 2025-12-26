@@ -29,7 +29,7 @@
 #define TD_BIGINT 36
 
 #define BATCH_SIZE 1000
-#define BUFFER_SIZE 4194304
+#define BUFFER_SIZE 16777216  /* 16MB buffer for throughput - safe for FNC_malloc */
 
 typedef struct {
     char bridge_host[256];
@@ -86,6 +86,23 @@ static int ymd_to_epoch_days(int y, int m, int d) {
     return era * 146097 + (int)doe - 719468;
 }
 
+static long long time_to_picos(void *val) {
+    unsigned int s_scaled; memcpy(&s_scaled, val, 4);
+    unsigned char hour = ((unsigned char*)val)[4], min = ((unsigned char*)val)[5];
+    /* Trino TIME expects picos since midnight */
+    return ((long long)(hour % 24) * 3600 + (long long)(min % 60) * 60) * 1000000000000LL + (long long)s_scaled * 1000000LL;
+}
+
+static long long timestamp_to_micros(void *val) {
+    unsigned int s_scaled; memcpy(&s_scaled, val, 4);
+    unsigned short year; memcpy(&year, (char*)val + 4, 2);
+    unsigned char mon = ((unsigned char*)val)[6], day = ((unsigned char*)val)[7], 
+                  hour = ((unsigned char*)val)[8], min = ((unsigned char*)val)[9];
+    int days = ymd_to_epoch_days(year, mon, day);
+    /* Trino TIMESTAMP expects micros since epoch */
+    return (long long)days * 86400000000LL + (long long)(hour % 24) * 3600000000LL + (long long)(min % 60) * 60000000LL + (long long)s_scaled;
+}
+
 static int write_unicode_to_utf8(unsigned char *buf, const unsigned char *val, int bytes) {
     int i = 0, j = 0;
     unsigned char *out = buf + 2;
@@ -116,26 +133,35 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
 
     if (param_stream && FNC_TblOpRead(param_stream) == TBLOP_SUCCESS) {
         int c;
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < 4; c++) {
             if (c >= FNC_TblOpGetColCount(1, ISINPUT)) break;
             void *val = param_stream->row->columnptr[c];
-            if (TBLOPISNULL(param_stream->row->indicators, c)) continue;
+            if (!val || TBLOPISNULL(param_stream->row->indicators, c)) continue;
             
+            if (c == 3) {
+                int bs = 0;
+                memcpy(&bs, val, 4);
+                if (bs > 0) params->batch_size = bs;
+                continue;
+            }
+
             int actual_len = param_stream->row->lengths[c];
+            if (actual_len <= 0) continue;
+
             char tmp[1024] = "";
             char *src = (char*)val;
             int src_len = actual_len;
 
-            /* Check for VARCHAR prefix */
+            /* Check for VARCHAR prefix (2 bytes length) */
             if (actual_len >= 2) {
-                short vlen = *(short*)val;
-                if (vlen == (short)(actual_len - 2)) {
+                unsigned short vlen = *(unsigned short*)val;
+                if (vlen == (unsigned short)(actual_len - 2)) {
                     src += 2; src_len = vlen;
                 }
             }
 
             if (src_len > 0) {
-                /* Detect UTF-16: if second byte is 0 and fourth byte is 0 */
+                /* Detect UTF-16: if second byte is 0 */
                 if (src_len >= 2 && src[1] == '\0') {
                     int i, j = 0;
                     for (i = 0; i < src_len && j < 1023; i += 2) {
@@ -150,12 +176,15 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
             }
 
             /* Trim trailing spaces */
-            char *end = tmp + strlen(tmp) - 1;
-            while(end >= tmp && (*end == ' ' || *end == '\0')) { *end = '\0'; end--; }
+            int len = strlen(tmp);
+            if (len > 0) {
+                char *end = tmp + len - 1;
+                while(end >= tmp && (*end == ' ' || *end == '\0')) { *end = '\0'; end--; }
+            }
 
-            if (c == 0) strcpy(target_ips, tmp);
-            else if (c == 1) strcpy(params->query_id, tmp);
-            else if (c == 2) strcpy(params->security_token, tmp);
+            if (c == 0) { strncpy(params->bridge_host, tmp, 255); params->bridge_host[255] = '\0'; strcpy(target_ips, tmp); }
+            else if (c == 1) { strncpy(params->query_id, tmp, 255); params->query_id[255] = '\0'; }
+            else if (c == 2) { strncpy(params->security_token, tmp, 255); params->security_token[255] = '\0'; }
         }
     }
 
@@ -255,7 +284,7 @@ void ExportToTrino_contract(INTEGER *Result, int *indicator_Result, char sqlstat
     oCols->column_types[6].datatype = VARCHAR_DT; oCols->column_types[6].bytesize = 258; oCols->column_types[6].size.length = 256; oCols->column_types[6].charset = LATIN_CT;
     FNC_TblOpSetContractDef(mycontract, strlen(mycontract) + 1);
     FNC_TblOpSetOutputColDef(0, oCols);
-    /* Only set format for the primary data stream (0) and output stream */
+    /* Set format for primary data stream and output stream */
     FNC_TblOpSetFormat("RECFMT", 0, ISINPUT, &format, sizeof(format));
     FNC_TblOpSetFormat("RECFMT", 0, ISOUTPUT, &format, sizeof(format));
     FNC_free(oCols); *Result = 1; *indicator_Result = 0;
@@ -289,6 +318,9 @@ void ExportToTrino(void) {
     FNC_TblOpGetColDef(0, ISINPUT, iCols);
 
     bb = (unsigned char *)FNC_malloc(BUFFER_SIZE);
+    if (!bb) {
+        stats.error_code = 1005; strcpy(stats.error_message, "Batch buffer malloc failed"); goto send_status;
+    }
     sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(params.bridge_port);
@@ -327,8 +359,8 @@ void ExportToTrino(void) {
             case TD_BIGINT: tn = "BIGINT"; break;
             case TD_FLOAT: tn = "DOUBLE"; break;
             case TD_DATE: tn = "DATE"; break; /* Date is fine as binary */
-            case TD_TIME: tn = "VARCHAR"; break; /* Revert to string for now */
-            case TD_TIMESTAMP: tn = "VARCHAR"; break; /* Revert to string for now */
+            case TD_TIME: tn = "TIME"; break; /* Binary picos */
+            case TD_TIMESTAMP: tn = "TIMESTAMP"; break; /* Binary micros */
             case TD_DECIMAL:
                 if (iCols->column_types[col].bytesize <= 8) tn = "DECIMAL_SHORT";
                 else tn = "DECIMAL_LONG";
@@ -386,19 +418,9 @@ void ExportToTrino(void) {
                     int day = md % 100;
                     batch_offset += write_int32(bb + batch_offset, ymd_to_epoch_days(year, month, day));
                 } else if (dt == TD_TIME) {
-                    unsigned int s_scaled; memcpy(&s_scaled, val, 4);
-                    unsigned char hour = ((unsigned char*)val)[4], min = ((unsigned char*)val)[5];
-                    double sec = s_scaled / 1000000.0;
-                    char ts[32]; int l = sprintf(ts, "%02d:%02d:%09.6f", hour % 24, min % 60, sec);
-                    write_uint16(bb + batch_offset, (short)l); memcpy(bb + batch_offset + 2, ts, l); batch_offset += 2 + l;
+                    batch_offset += write_int64(bb + batch_offset, time_to_picos(val));
                 } else if (dt == TD_TIMESTAMP) {
-                    unsigned int s_scaled; memcpy(&s_scaled, val, 4);
-                    unsigned short year; memcpy(&year, (char*)val + 4, 2);
-                    unsigned char mon = ((unsigned char*)val)[6], day = ((unsigned char*)val)[7], 
-                                  hour = ((unsigned char*)val)[8], min = ((unsigned char*)val)[9];
-                    double sec = s_scaled / 1000000.0;
-                    char tss[64]; int l = sprintf(tss, "%04d-%02d-%02d %02d:%02d:%09.6f", year, mon, day, hour, min, sec);
-                    write_uint16(bb + batch_offset, (short)l); memcpy(bb + batch_offset + 2, tss, l); batch_offset += 2 + l;
+                    batch_offset += write_int64(bb + batch_offset, timestamp_to_micros(val));
                 } else if (dt == TD_DECIMAL) {
                     int bsize = iCols->column_types[col].bytesize;
                     if (bsize <= 8) {

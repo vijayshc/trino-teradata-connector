@@ -21,10 +21,12 @@ public class TrinoExportConfig {
     private String workerAdvertisedAddresses;  // For NAT/multi-homed networks
 
     // === Buffer/Performance Settings ===
-    private int socketReceiveBufferSize = 4 * 1024 * 1024;  // 4MB
-    private int inputBufferSize = 1024 * 1024;              // 1MB
+    private int batchSize = 100000;
+    private int socketReceiveBufferSize = 64 * 1024 * 1024;  // 64MB
+    private int inputBufferSize = 8 * 1024 * 1024;           // 8MB
     private int bufferQueueCapacity = 100;
     private long pagePollTimeoutMs = 500;
+    private int splitsPerWorker = 4;
 
     // === Dynamic Filtering Settings ===
     private Duration dynamicFilterTimeout = new Duration(10, TimeUnit.SECONDS);
@@ -163,6 +165,16 @@ public class TrinoExportConfig {
     // Buffer/Performance Getters/Setters
     // ============================================================
 
+    public int getBatchSize() {
+        return batchSize;
+    }
+    
+    @Config("teradata.export.batch-size")
+    public TrinoExportConfig setBatchSize(int batchSize) {
+        this.batchSize = batchSize;
+        return this;
+    }
+
     public int getSocketReceiveBufferSize() {
         return socketReceiveBufferSize;
     }
@@ -200,6 +212,16 @@ public class TrinoExportConfig {
     @Config("teradata.export.page-poll-timeout-ms")
     public TrinoExportConfig setPagePollTimeoutMs(long pagePollTimeoutMs) {
         this.pagePollTimeoutMs = pagePollTimeoutMs;
+        return this;
+    }
+
+    public int getSplitsPerWorker() {
+        return splitsPerWorker;
+    }
+
+    @Config("teradata.export.splits-per-worker")
+    public TrinoExportConfig setSplitsPerWorker(int splitsPerWorker) {
+        this.splitsPerWorker = splitsPerWorker;
         return this;
     }
 
