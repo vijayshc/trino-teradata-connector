@@ -60,4 +60,12 @@ find "$TARGET_DIR" -name "*.class" -delete
 find "$TARGET_DIR" -name "*.o" -delete
 find "$TARGET_DIR" -type d -name "target" -not -path "$TARGET_DIR/target" -exec rm -rf {} +
 
+cp -r $SOURCE_DIR/opensource/* /home/vijay/gitrepo/trino-connector/trino-teradata-connector/
+cd /home/vijay/gitrepo/trino-connector/trino-teradata-connector/scripts
+rm -rf TeradataTool*
+cd /home/vijay/gitrepo/trino-connector/trino-teradata-connector/
+git add -A *
+git commit -m "$1"
+git push
+
 echo "=== Sync Complete ==="

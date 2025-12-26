@@ -142,13 +142,17 @@ public class TeradataBridgeServer implements AutoCloseable {
             long compressedBytes = 0;
             long decompressedBytes = 0;
             
+            // Initialize profiler for this query
+            PerformanceProfiler.getOrCreate(queryId);
+            
             // Reusable buffer for decompression (Option E: Buffer Pooling)
             java.util.zip.Inflater inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
             byte[] decompressionBuffer = compressionEnabled ? new byte[64 * 1024 * 1024] : null;
 
-
             // Read batches until end of stream
             while (true) {
+                // Profile: Network Read
+                long netStart = System.nanoTime();
                 int batchLen = in.readInt();
                 if (batchLen == 0) {
                     log.info("End of stream (marker) for query %s", queryId);
@@ -157,24 +161,45 @@ public class TeradataBridgeServer implements AutoCloseable {
                 
                 byte[] batchData = new byte[batchLen];
                 in.readFully(batchData);
+                long netEnd = System.nanoTime();
+                PerformanceProfiler.recordNetworkRead(queryId, netEnd - netStart, batchLen);
                 compressedBytes += batchLen;
                 
                 VectorSchemaRoot root;
+                int dLen;
                 if (compressionEnabled) {
-                    // Standard Java decompression with buffer reuse (Option E)
+                    // Profile: Decompression
+                    long decompStart = System.nanoTime();
                     inflater.reset();
                     inflater.setInput(batchData);
-                    int dLen = inflater.inflate(decompressionBuffer);
+                    dLen = inflater.inflate(decompressionBuffer);
+                    long decompEnd = System.nanoTime();
+                    PerformanceProfiler.recordDecompression(queryId, decompEnd - decompStart, dLen);
                     decompressedBytes += dLen;
+                    
+                    // Profile: Arrow Parsing
+                    long parseStart = System.nanoTime();
                     root = parseBatch(decompressionBuffer, dLen, columns, arrowSchema);
+                    long parseEnd = System.nanoTime();
+                    PerformanceProfiler.recordArrowParsing(queryId, parseEnd - parseStart, root.getRowCount());
                 } else {
                     decompressedBytes += batchLen;
+                    dLen = batchLen;
+                    
+                    // Profile: Arrow Parsing (no decompression)
+                    long parseStart = System.nanoTime();
                     root = parseBatch(batchData, batchLen, columns, arrowSchema);
+                    long parseEnd = System.nanoTime();
+                    PerformanceProfiler.recordArrowParsing(queryId, parseEnd - parseStart, root.getRowCount());
                 }
 
-                
                 totalRows += root.getRowCount();
+                
+                // Profile: Queue Push
+                long pushStart = System.nanoTime();
                 DataBufferRegistry.pushData(queryId, root);
+                long pushEnd = System.nanoTime();
+                PerformanceProfiler.recordQueuePush(queryId, pushEnd - pushStart, (pushEnd - pushStart) > 1_000_000);
             }
             
             out.write("OK".getBytes(StandardCharsets.UTF_8));

@@ -86,7 +86,13 @@ public class TrinoExportPageSource implements ConnectorPageSource {
         }
 
         try {
+            // Profile: Queue Poll
+            long pollStart = System.nanoTime();
             BatchContainer container = buffer.poll(pagePollTimeoutMs, TimeUnit.MILLISECONDS);
+            long pollEnd = System.nanoTime();
+            boolean waited = container == null || (pollEnd - pollStart) > 1_000_000;
+            PerformanceProfiler.recordQueuePoll(queryId, pollEnd - pollStart, waited);
+            
             if (container == null) {
                 return null;
             }
@@ -96,6 +102,8 @@ public class TrinoExportPageSource implements ConnectorPageSource {
                 finished = true;
                 // Re-push the marker so other parallel consumers for the same query can also finish
                 DataBufferRegistry.pushEndMarker(queryId);
+                // Generate and log performance profile summary
+                PerformanceProfiler.generateSummary(queryId);
                 return null;
             }
 
@@ -104,7 +112,13 @@ public class TrinoExportPageSource implements ConnectorPageSource {
                 if (enableDebugLogging) {
                     log.info("Converting batch with %d rows for query %s", root.getRowCount(), queryId);
                 }
+                
+                // Profile: Page Conversion
+                long convStart = System.nanoTime();
                 Page page = convertToPage(root);
+                long convEnd = System.nanoTime();
+                PerformanceProfiler.recordPageConversion(queryId, convEnd - convStart);
+                
                 completedBytes += page.getSizeInBytes();
                 return SourcePage.create(page);
             } catch (Exception e) {
@@ -118,6 +132,7 @@ public class TrinoExportPageSource implements ConnectorPageSource {
             finished = true;
             return null;
         }
+
     }
 
     private Page convertToPage(VectorSchemaRoot root) {
