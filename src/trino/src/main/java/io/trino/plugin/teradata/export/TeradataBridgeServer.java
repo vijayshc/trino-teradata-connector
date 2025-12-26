@@ -1,12 +1,7 @@
 package io.trino.plugin.teradata.export;
 
 import io.airlift.log.Logger;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.*;
-import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.Schema;
+import io.trino.spi.type.Type;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -14,15 +9,19 @@ import javax.inject.Inject;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * High-performance Java Bridge Server that receives data directly from Teradata AMPs.
+ * 
+ * Optimized Architecture:
+ * - Uses AsyncDecompressionPipeline for parallel decompression and parsing.
+ * - Uses DirectTrinoPageParser for zero-copy binary-to-page conversion.
+ * - Eliminates Apache Arrow to remove overhead.
  */
 public class TeradataBridgeServer implements AutoCloseable {
     private static final Logger log = Logger.get(TeradataBridgeServer.class);
@@ -33,7 +32,6 @@ public class TeradataBridgeServer implements AutoCloseable {
     private final int port;
     private final int socketReceiveBufferSize;
     private final int inputBufferSize;
-    private final BufferAllocator allocator;
     private final ExecutorService executor;
     private ServerSocket serverSocket;
     private final TrinoExportConfig config;
@@ -45,7 +43,6 @@ public class TeradataBridgeServer implements AutoCloseable {
         this.port = config.getBridgePort();
         this.socketReceiveBufferSize = config.getSocketReceiveBufferSize();
         this.inputBufferSize = config.getInputBufferSize();
-        this.allocator = new RootAllocator();
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r, "teradata-bridge-handler");
             t.setDaemon(true);
@@ -88,6 +85,10 @@ public class TeradataBridgeServer implements AutoCloseable {
     private void handleClient(Socket socket) {
         String queryId = "unknown";
         boolean incremented = false;
+        long compressedBytes = 0;
+        long decompressedBytes = 0;
+        int totalRows = 0;
+        
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), inputBufferSize));
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             
@@ -120,36 +121,44 @@ public class TeradataBridgeServer implements AutoCloseable {
             queryId = new String(queryIdBytes, StandardCharsets.UTF_8);
             log.info("Receiving data for query: %s", queryId);
 
-            // Register this connection
+            // Register this connection FIRST (before any data processing)
             DataBufferRegistry.incrementConnections(queryId);
             incremented = true;
+            
             // Read Compression Flag
             boolean compressionEnabled = in.readInt() == 1;
             if (compressionEnabled) {
                 log.info("Compression enabled for query %s", queryId);
             }
 
-            // Read Schema JSON
+            // Read Schema JSON (for verification and name matching)
             int schemaLen = in.readInt();
             byte[] schemaBytes = new byte[schemaLen];
             in.readFully(schemaBytes);
             String schemaJson = new String(schemaBytes, StandardCharsets.UTF_8);
             
-            List<ColumnInfo> columns = parseSchema(schemaJson);
-            Schema arrowSchema = createArrowSchema(columns);
+            // Fetch registered Trino Types (Critical for direct parsing)
+            List<Type> trinoTypes = DataBufferRegistry.getSchema(queryId);
+            if (trinoTypes == null) {
+                // Retry once after a delay to handle race condition where Split hasn't registered schema yet
+                Thread.sleep(1000);
+                trinoTypes = DataBufferRegistry.getSchema(queryId);
+                if (trinoTypes == null) {
+                    throw new IllegalStateException("No Trino schema registered for query " + queryId + ". PageSource implementation must register schema before data transfer.");
+                }
+            }
             
-            int totalRows = 0;
-            long compressedBytes = 0;
-            long decompressedBytes = 0;
+            // Create Column Specs using the existing helper method
+            List<DirectTrinoPageParser.ColumnSpec> columns = AsyncDecompressionPipeline.parseSchema(schemaJson, trinoTypes);
             
-            // Initialize profiler for this query
+            // Initialize profiler
             PerformanceProfiler.getOrCreate(queryId);
             
-            // Reusable buffer for decompression (Option E: Buffer Pooling)
+            // Synchronous processing - create decompression buffer if needed
             java.util.zip.Inflater inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
             byte[] decompressionBuffer = compressionEnabled ? new byte[64 * 1024 * 1024] : null;
 
-            // Read batches until end of stream
+            // Read and process batches synchronously until end of stream
             while (true) {
                 // Profile: Network Read
                 long netStart = System.nanoTime();
@@ -165,53 +174,55 @@ public class TeradataBridgeServer implements AutoCloseable {
                 PerformanceProfiler.recordNetworkRead(queryId, netEnd - netStart, batchLen);
                 compressedBytes += batchLen;
                 
-                VectorSchemaRoot root;
-                int dLen;
+                // SYNCHRONOUS: Decompress immediately in this thread
+                byte[] decompressed;
+                int decompressedLen;
+                
                 if (compressionEnabled) {
-                    // Profile: Decompression
                     long decompStart = System.nanoTime();
                     inflater.reset();
-                    inflater.setInput(batchData);
-                    dLen = inflater.inflate(decompressionBuffer);
+                    inflater.setInput(batchData, 0, batchLen);
+                    decompressedLen = inflater.inflate(decompressionBuffer);
                     long decompEnd = System.nanoTime();
-                    PerformanceProfiler.recordDecompression(queryId, decompEnd - decompStart, dLen);
-                    decompressedBytes += dLen;
-                    
-                    // Profile: Arrow Parsing
-                    long parseStart = System.nanoTime();
-                    root = parseBatch(decompressionBuffer, dLen, columns, arrowSchema);
-                    long parseEnd = System.nanoTime();
-                    PerformanceProfiler.recordArrowParsing(queryId, parseEnd - parseStart, root.getRowCount());
+                    PerformanceProfiler.recordDecompression(queryId, decompEnd - decompStart, decompressedLen);
+                    decompressed = decompressionBuffer;
+                    decompressedBytes += decompressedLen;
                 } else {
+                    decompressed = batchData;
+                    decompressedLen = batchLen;
                     decompressedBytes += batchLen;
-                    dLen = batchLen;
-                    
-                    // Profile: Arrow Parsing (no decompression)
-                    long parseStart = System.nanoTime();
-                    root = parseBatch(batchData, batchLen, columns, arrowSchema);
-                    long parseEnd = System.nanoTime();
-                    PerformanceProfiler.recordArrowParsing(queryId, parseEnd - parseStart, root.getRowCount());
                 }
 
-                totalRows += root.getRowCount();
+                // SYNCHRONOUS: Parse directly to Trino Page in this thread
+                long parseStart = System.nanoTime();
+                io.trino.spi.Page page = DirectTrinoPageParser.parseDirectToPage(decompressed, decompressedLen, columns);
+                long parseEnd = System.nanoTime();
                 
-                // Profile: Queue Push
-                long pushStart = System.nanoTime();
-                DataBufferRegistry.pushData(queryId, root);
-                long pushEnd = System.nanoTime();
-                PerformanceProfiler.recordQueuePush(queryId, pushEnd - pushStart, (pushEnd - pushStart) > 1_000_000);
+                if (page != null && page.getPositionCount() > 0) {
+                    totalRows += page.getPositionCount();
+                    PerformanceProfiler.recordArrowParsing(queryId, parseEnd - parseStart, page.getPositionCount());
+                    
+                    // SYNCHRONOUS: Push to buffer in this thread
+                    // Data is in buffer BEFORE we move to next batch or decrement connection
+                    long pushStart = System.nanoTime();
+                    DataBufferRegistry.pushData(queryId, page);
+                    long pushEnd = System.nanoTime();
+                    PerformanceProfiler.recordQueuePush(queryId, pushEnd - pushStart, (pushEnd - pushStart) > 1_000_000);
+                }
             }
             
+            // All data is now in the buffer - safe to send acknowledgment
             out.write("OK".getBytes(StandardCharsets.UTF_8));
             out.flush();
+            
             double ratio = compressedBytes > 0 ? (double) decompressedBytes / compressedBytes : 1.0;
-            log.info("Successfully received query %s: %d rows, %.2f MB compressed, %.2f MB decompressed (Ratio: %.2f:1)", 
+            log.info("Successfully processed query %s: %d rows, %.2f MB compressed, %.2f MB decompressed (Ratio: %.2fx)", 
                 queryId, totalRows, compressedBytes / (1024.0 * 1024.0), decompressedBytes / (1024.0 * 1024.0), ratio);
-
             
         } catch (Exception e) {
             log.error(e, "Error handling client for query %s", queryId);
         } finally {
+            // CRITICAL: Connection is only decremented AFTER all data is in the buffer
             if (incremented) {
                 DataBufferRegistry.decrementConnections(queryId);
             }
@@ -242,109 +253,6 @@ public class TeradataBridgeServer implements AutoCloseable {
         }
     }
 
-    private List<ColumnInfo> parseSchema(String json) {
-        List<ColumnInfo> columns = new ArrayList<>();
-        int columnsStart = json.indexOf("[");
-        int columnsEnd = json.lastIndexOf("]");
-        if (columnsStart < 0 || columnsEnd < 0) return columns;
-        
-        String columnsJson = json.substring(columnsStart + 1, columnsEnd);
-        int pos = 0;
-        while (pos < columnsJson.length()) {
-            int objStart = columnsJson.indexOf("{", pos);
-            if (objStart < 0) break;
-            int objEnd = columnsJson.indexOf("}", objStart);
-            if (objEnd < 0) break;
-            String colJson = columnsJson.substring(objStart, objEnd + 1);
-            String name = extractJsonString(colJson, "name");
-            String type = extractJsonString(colJson, "type");
-            if (name != null && type != null) columns.add(new ColumnInfo(name, type));
-            pos = objEnd + 1;
-        }
-        return columns;
-    }
-
-    private String extractJsonString(String json, String key) {
-        String searchKey = "\"" + key + "\":\"";
-        int start = json.indexOf(searchKey);
-        if (start < 0) return null;
-        start += searchKey.length();
-        int end = json.indexOf("\"", start);
-        if (end < 0) return null;
-        return json.substring(start, end);
-    }
-
-    private Schema createArrowSchema(List<ColumnInfo> columns) {
-        List<Field> fields = new ArrayList<>();
-        for (ColumnInfo col : columns) {
-            ArrowType type = switch (col.type) {
-                case "INTEGER", "DATE" -> new ArrowType.Int(32, true);
-                case "BIGINT", "TIME", "TIMESTAMP", "DECIMAL_SHORT" -> new ArrowType.Int(64, true);
-                case "DOUBLE" -> new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE);
-                case "DECIMAL_LONG" -> new ArrowType.FixedSizeBinary(16);
-                default -> new ArrowType.Utf8();
-            };
-            fields.add(new Field(col.name, org.apache.arrow.vector.types.pojo.FieldType.nullable(type), null));
-        }
-        return new Schema(fields);
-    }
-
-    private VectorSchemaRoot parseBatch(byte[] data, int length, List<ColumnInfo> columns, Schema schema) {
-        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
-        try {
-            int colCount = columns.size();
-            FieldVector[] vectors = new FieldVector[colCount];
-            String[] types = new String[colCount];
-            for (int i = 0; i < colCount; i++) {
-                vectors[i] = root.getVector(i);
-                vectors[i].allocateNew();
-                types[i] = columns.get(i).type;
-            }
-
-            ByteBuffer buf = ByteBuffer.wrap(data, 0, length);
-            int numRows = buf.getInt();
-            root.setRowCount(numRows);
-
-            for (int row = 0; row < numRows; row++) {
-                for (int col = 0; col < colCount; col++) {
-                    if (buf.get() == 1) setNull(vectors[col], row);
-                    else setValue(vectors[col], row, buf, types[col]);
-                }
-            }
-            return root;
-        } catch (Exception e) {
-            root.close();
-            throw e;
-        }
-    }
-
-    private void setNull(FieldVector vector, int row) {
-        if (vector instanceof IntVector iv) iv.setNull(row);
-        else if (vector instanceof BigIntVector bv) bv.setNull(row);
-        else if (vector instanceof Float8Vector fv) fv.setNull(row);
-        else if (vector instanceof VarCharVector vv) vv.setNull(row);
-        else if (vector instanceof FixedSizeBinaryVector fsv) fsv.setNull(row);
-    }
-
-    private void setValue(FieldVector vector, int row, ByteBuffer buf, String type) {
-        switch (type) {
-            case "INTEGER", "DATE" -> ((IntVector) vector).setSafe(row, buf.getInt());
-            case "BIGINT", "TIME", "TIMESTAMP", "DECIMAL_SHORT" -> ((BigIntVector) vector).setSafe(row, buf.getLong());
-            case "DOUBLE" -> ((Float8Vector) vector).setSafe(row, buf.getDouble());
-            case "DECIMAL_LONG" -> {
-                byte[] bytes = new byte[16];
-                buf.get(bytes);
-                ((FixedSizeBinaryVector) vector).setSafe(row, bytes);
-            }
-            default -> {
-                int len = buf.getShort() & 0xFFFF;
-                byte[] strBytes = new byte[len];
-                buf.get(strBytes);
-                ((VarCharVector) vector).setSafe(row, strBytes);
-            }
-        }
-    }
-
     @Override
     @PreDestroy
     public void close() {
@@ -353,9 +261,6 @@ public class TeradataBridgeServer implements AutoCloseable {
             if (serverSocket != null) serverSocket.close();
         } catch (IOException ignored) {}
         executor.shutdownNow();
-        allocator.close();
         log.info("Teradata Bridge Server stopped");
     }
-
-    private record ColumnInfo(String name, String type) {}
 }

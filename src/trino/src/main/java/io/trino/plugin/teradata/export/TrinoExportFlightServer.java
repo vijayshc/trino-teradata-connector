@@ -48,7 +48,9 @@ public class TrinoExportFlightServer implements FlightProducer, AutoCloseable {
                         originalRoot.getVector(i).makeTransferPair(clonedRoot.getVector(i)).transfer();
                     }
                     clonedRoot.setRowCount(originalRoot.getRowCount());
-                    DataBufferRegistry.pushData(queryId, clonedRoot); 
+                    // DataBufferRegistry.pushData(queryId, clonedRoot); 
+                    // Flight support temporarily disabled due to architecture change to Direct Page Parsing
+                    clonedRoot.close();
                 }
                 ackStream.onCompleted();
             } catch (Exception e) {

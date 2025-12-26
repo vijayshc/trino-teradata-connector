@@ -17,17 +17,11 @@
 #include "sqltypes_td.h"
 
 /* Real Teradata Internal Data Type Codes confirmed by binary diagnostics */
-#define TD_CHAR 1
-#define TD_VARCHAR 2
-#define TD_BYTEINT 7
-#define TD_SMALLINT 8
-#define TD_INTEGER 9
-#define TD_FLOAT 10
-#define TD_DECIMAL 14
-#define TD_DATE 15
-#define TD_TIME 16
-#define TD_TIMESTAMP 17
-#define TD_BIGINT 36
+/* Real Teradata Internal Data Type Codes confirmed by binary diagnostics */
+/* Using standard SQLTYPES_TD.H enums instead of manual defines to prevent duplicate case errors */
+/* #define TD_CHAR 1 */
+/* #define TD_VARCHAR 2 */ 
+/* ... Relying on system headers ... */
 
 #define BATCH_SIZE 1000
 #define BUFFER_SIZE 16777216  /* 16MB buffer for throughput - safe for FNC_malloc */
@@ -270,7 +264,8 @@ static int write_hex_string(unsigned char *buf, void *value, int bytesize) {
     int len = bytesize * 2;
     if (len > 32767) len = 32767; 
     write_uint16(buf, (unsigned short)len);
-    for (int i = 0; i < len/2; i++) {
+    int i;
+    for (i = 0; i < len/2; i++) {
         buf[2 + i*2] = hex[(p[i] >> 4) & 0xF];
         buf[2 + i*2 + 1] = hex[p[i] & 0xF];
     }
@@ -290,7 +285,8 @@ static int write_decimal_as_string(unsigned char *buf, void *value, int bytesize
     if (abs_val == 0) tmp[i++] = '0';
     while (abs_val > 0) { tmp[i++] = (char)(abs_val % 10 + '0'); abs_val /= 10; }
     while (i <= scale) tmp[i++] = '0';
-    for (int j = 0; j < i; j++) {
+    int j;
+    for (j = 0; j < i; j++) {
         if (i - j == scale && scale > 0) str[len++] = '.';
         str[len++] = tmp[i - 1 - j];
     }
@@ -390,17 +386,18 @@ void ExportToTrino(void) {
     for (col = 0; col < tic; col++) {
         char cd[256]; const char *tn; int dt = iCols->column_types[col].datatype;
         switch(dt) {
-            case TD_CHAR: case TD_VARCHAR: tn = "VARCHAR"; break;
-            case TD_INTEGER: case TD_SMALLINT: case TD_BYTEINT: tn = "INTEGER"; break;
-            case TD_BIGINT: tn = "BIGINT"; break;
-            case TD_FLOAT: tn = "DOUBLE"; break;
-            case TD_DATE: tn = "DATE"; break; /* Date is fine as binary */
-            case TD_TIME: tn = "TIME"; break; /* Binary picos */
-            case TD_TIMESTAMP: tn = "TIMESTAMP"; break; /* Binary micros */
-            case TD_DECIMAL:
-                if (iCols->column_types[col].bytesize <= 8) tn = "DECIMAL_SHORT";
-                else tn = "DECIMAL_LONG";
-                break;
+            case CHAR_DT: case VARCHAR_DT: tn = "VARCHAR"; break;
+            case INTEGER_DT: case SMALLINT_DT: case BYTEINT_DT: tn = "INTEGER"; break;
+            case BIGINT_DT: tn = "BIGINT"; break;
+            case REAL_DT: tn = "DOUBLE"; break;
+            case DATE_DT: tn = "DATE"; break; 
+            case TIME_DT: tn = "TIME"; break; 
+            case TIMESTAMP_DT: tn = "TIMESTAMP"; break; 
+            case DECIMAL1_DT: case DECIMAL2_DT: case DECIMAL4_DT: case DECIMAL8_DT: 
+            /* case 10: removed duplicate */
+                tn = "DECIMAL_SHORT"; break;
+            case DECIMAL16_DT:
+                tn = "DECIMAL_LONG"; break;
             default: tn = "VARCHAR"; break;
         }
         snprintf(cd, 256, "%s{\"name\":\"col_%d\",\"type\":\"%s\"}", col > 0 ? "," : "", col, tn); strcat(sj, cd);
@@ -423,28 +420,28 @@ void ExportToTrino(void) {
                 int cs = iCols->column_types[col].charset;
                 void *val = in->row->columnptr[col];
                 
-                if (dt == TD_VARCHAR) {
+                if (dt == VARCHAR_DT || dt == 2) { /* 2=TD_VARCHAR */
                     short blen = *(short*)val;
                     if (cs == 2 || cs == 6) batch_offset += write_unicode_to_utf8(bb + batch_offset, (unsigned char*)val + 2, blen);
                     else {
                         write_uint16(bb + batch_offset, blen); memcpy(bb + batch_offset + 2, (char*)val + 2, blen);
                         batch_offset += 2 + blen;
                     }
-                } else if (dt == TD_CHAR) {
+                } else if (dt == CHAR_DT || dt == 1) { /* 1=TD_CHAR */
                     int blen = iCols->column_types[col].bytesize;
                     if (cs == 2 || cs == 6) batch_offset += write_unicode_to_utf8(bb + batch_offset, (unsigned char*)val, blen);
                     else {
                         write_uint16(bb + batch_offset, (unsigned short)blen); memcpy(bb + batch_offset + 2, (char*)val, blen);
                         batch_offset += 2 + blen;
                     }
-                } else if (dt == TD_INTEGER) batch_offset += write_int32(bb + batch_offset, *(int*)val);
-                else if (dt == TD_BIGINT) batch_offset += write_int64(bb + batch_offset, *(long long*)val);
-                else if (dt == TD_SMALLINT) batch_offset += write_int32(bb + batch_offset, (int)*(short*)val);
-                else if (dt == TD_BYTEINT) batch_offset += write_int32(bb + batch_offset, (int)*(__int8_t*)val);
-                else if (dt == TD_FLOAT) {
+                } else if (dt == INTEGER_DT) batch_offset += write_int32(bb + batch_offset, *(int*)val);
+                else if (dt == BIGINT_DT) batch_offset += write_int64(bb + batch_offset, *(long long*)val);
+                else if (dt == SMALLINT_DT) batch_offset += write_int32(bb + batch_offset, (int)*(short*)val);
+                else if (dt == BYTEINT_DT) batch_offset += write_int32(bb + batch_offset, (int)*(__int8_t*)val);
+                else if (dt == REAL_DT) {
                     long long lv; memcpy(&lv, val, 8);
                     batch_offset += write_int64(bb + batch_offset, lv);
-                } else if (dt == TD_DATE) {
+                } else if (dt == DATE_DT) {
                     int d = *(int*)val;
                     int y_off = d / 10000;
                     int md = d % 10000;
@@ -453,11 +450,11 @@ void ExportToTrino(void) {
                     int month = md / 100;
                     int day = md % 100;
                     batch_offset += write_int32(bb + batch_offset, ymd_to_epoch_days(year, month, day));
-                } else if (dt == TD_TIME) {
+                } else if (dt == TIME_DT) {
                     batch_offset += write_int64(bb + batch_offset, time_to_picos(val));
-                } else if (dt == TD_TIMESTAMP) {
+                } else if (dt == TIMESTAMP_DT) {
                     batch_offset += write_int64(bb + batch_offset, timestamp_to_micros(val));
-                } else if (dt == TD_DECIMAL) {
+                } else if (dt == DECIMAL1_DT || dt == DECIMAL2_DT || dt == DECIMAL4_DT || dt == DECIMAL8_DT || dt == 14) { /* 14=TD_DECIMAL */
                     int bsize = iCols->column_types[col].bytesize;
                     if (bsize <= 8) {
                         long long v = 0;
@@ -467,10 +464,13 @@ void ExportToTrino(void) {
                         else if (bsize == 8) v = *(long long*)val;
                         batch_offset += write_int64(bb + batch_offset, v);
                     } else {
-                        /* 16-byte decimal, send as raw bytes (Big Endian for consistency) */
+                        /* 16-byte decimal */
                         memcpy(bb + batch_offset, val, 16);
                         batch_offset += 16;
                     }
+                } else if (dt == DECIMAL16_DT) {
+                        memcpy(bb + batch_offset, val, 16);
+                        batch_offset += 16;
                 } else {
                     batch_offset += write_hex_string(bb + batch_offset, val, iCols->column_types[col].bytesize);
                 }

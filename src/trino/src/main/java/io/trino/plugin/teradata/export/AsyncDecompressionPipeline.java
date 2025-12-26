@@ -31,7 +31,6 @@ public final class AsyncDecompressionPipeline {
 
     // Queues for async pipeline
     private final BlockingQueue<CompressedBatch> compressedQueue;
-    private final BlockingQueue<Page> pageQueue;
 
     // Thread pools
     private final ExecutorService decompressionPool;
@@ -45,6 +44,8 @@ public final class AsyncDecompressionPipeline {
     // Inflater per thread (thread-local for thread safety)
     private static final ThreadLocal<Inflater> inflaters = 
             ThreadLocal.withInitial(Inflater::new);
+            
+    private final CountDownLatch workerLatch;
 
     public record CompressedBatch(byte[] data, int length, boolean isEndMarker) {}
 
@@ -59,9 +60,9 @@ public final class AsyncDecompressionPipeline {
         this.columns = columns;
         this.compressionEnabled = compressionEnabled;
         this.compressedQueue = new ArrayBlockingQueue<>(queueCapacity);
-        this.pageQueue = new ArrayBlockingQueue<>(queueCapacity);
         this.bufferPool = new ByteBufferPool(decompressorThreads * 2, 64 * 1024 * 1024);
-
+        this.workerLatch = new CountDownLatch(decompressorThreads);
+        
         this.decompressionPool = Executors.newFixedThreadPool(decompressorThreads, r -> {
             Thread t = new Thread(r, "async-decompress-" + queryId.substring(Math.max(0, queryId.length() - 8)));
             t.setDaemon(true);
@@ -90,18 +91,8 @@ public final class AsyncDecompressionPipeline {
         compressedQueue.put(new CompressedBatch(null, 0, true));
     }
 
-    /**
-     * Get next parsed Page. Returns null when finished.
-     */
-    public Page pollPage(long timeoutMs) throws InterruptedException {
-        if (finished && pageQueue.isEmpty()) {
-            return null;
-        }
-        return pageQueue.poll(timeoutMs, TimeUnit.MILLISECONDS);
-    }
-
     public boolean isFinished() {
-        return finished && pageQueue.isEmpty();
+        return finished;
     }
 
     public Throwable getError() {
@@ -151,22 +142,34 @@ public final class AsyncDecompressionPipeline {
 
                 decompressedBytes.addAndGet(decompressedLen);
 
-                // Parse directly to Trino Page (Option F)
+                // Parse directly to Trino Page
                 Page page = DirectTrinoPageParser.parseDirectToPage(decompressed, decompressedLen, columns);
                 if (page != null) {
-                    totalRows.addAndGet(page.getPositionCount());
-                    pageQueue.put(page);
+                    int rowCount = page.getPositionCount();
+                    totalRows.addAndGet(rowCount);
+                    if (rowCount > 0) {
+                        DataBufferRegistry.pushData(queryId, page);
+                        log.debug("Pushed page with %d rows for query %s", rowCount, queryId);
+                    } else {
+                        log.debug("Skipping empty page (0 rows) for query %s. Decompressed length: %d", queryId, decompressedLen);
+                    }
                 }
             }
         } catch (Exception e) {
             error = e;
             log.error(e, "Error in async decompression worker for query %s", queryId);
+        } finally {
+            workerLatch.countDown();
         }
     }
 
     public void shutdown() {
         finished = true;
         decompressionPool.shutdownNow();
+    }
+    
+    public void awaitCompletion() throws InterruptedException {
+        workerLatch.await();
     }
 
     /**

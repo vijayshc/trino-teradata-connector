@@ -30,8 +30,13 @@ public class TrinoExportConnector implements Connector {
         // Initialize DataBufferRegistry with configured queue capacity
         DataBufferRegistry.setBufferQueueCapacity(config.getBufferQueueCapacity());
         
-        log.info("TrinoExportConnector initialized with: bufferQueueCapacity=%d, pagePollTimeout=%dms, debugLogging=%s",
-                config.getBufferQueueCapacity(), config.getPagePollTimeoutMs(), config.isEnableDebugLogging());
+        // Initialize timezone offset for DirectTrinoPageParser
+        int tzOffsetSeconds = DirectTrinoPageParser.parseTimezoneToSeconds(config.getTeradataTimezone());
+        DirectTrinoPageParser.setTeradataTimezoneOffset(tzOffsetSeconds);
+        
+        log.info("TrinoExportConnector initialized with: bufferQueueCapacity=%d, pagePollTimeout=%dms, debugLogging=%s, timezone=%s (%d seconds)",
+                config.getBufferQueueCapacity(), config.getPagePollTimeoutMs(), config.isEnableDebugLogging(),
+                config.getTeradataTimezone(), tzOffsetSeconds);
     }
 
     @Override

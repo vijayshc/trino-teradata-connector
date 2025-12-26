@@ -1,6 +1,8 @@
 package io.trino.plugin.teradata.export;
 
-import org.apache.arrow.vector.VectorSchemaRoot;
+import io.trino.spi.Page;
+import io.trino.spi.type.Type;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -24,6 +26,7 @@ import io.airlift.log.Logger;
 public class DataBufferRegistry {
     private static final Logger log = Logger.get(DataBufferRegistry.class);
     private static final Map<String, QueryBuffer> queryBuffers = new ConcurrentHashMap<>();
+    private static final Map<String, List<Type>> schemaRegistry = new ConcurrentHashMap<>();
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "data-buffer-eos-scheduler");
         t.setDaemon(true);
@@ -38,6 +41,7 @@ public class DataBufferRegistry {
         final AtomicInteger activeConnections = new AtomicInteger(0);
         volatile boolean jdbcFinished = false;
         volatile boolean eosSignaled = false;
+        volatile boolean hadAnyConnections = false;  // Track if we ever saw a connection
         final long createdAt = System.currentTimeMillis();
         volatile long lastActivityTime = System.currentTimeMillis();
         final AtomicInteger activeConsumers = new AtomicInteger(0);
@@ -55,34 +59,58 @@ public class DataBufferRegistry {
 
         /**
          * Check and signal end-of-stream.
-         * Logic: Signal EOS when all connections are done AND JDBC finished signal received
-         * AND a short stabilization period has passed since last activity.
+         * 
+         * With SYNCHRONOUS processing in TeradataBridgeServer:
+         * - All data is pushed to buffer BEFORE connection is decremented
+         * - When activeConnections reaches 0, we know ALL data is in the buffer
+         * - We just need a short stabilization to handle any in-flight socket accepts
          */
         synchronized void checkAndSignalEos(String queryId) {
             if (eosSignaled) return;
             
-            if (jdbcFinished && activeConnections.get() == 0) {
+            if (jdbcFinished && activeConnections.get() == 0 && hadAnyConnections) {
+                // Data is guaranteed to be in buffer (synchronous processing)
+                // Just a minimal stabilization period for socket accept race conditions
                 long now = System.currentTimeMillis();
                 long idleTime = now - lastActivityTime;
                 
-                // Stabilization: wait at least 500ms after last activity or creation
-                // to ensure no sockets are in the OS accept queue or in-flight.
-                if (idleTime < 500) {
-                    log.debug("EOS check deferred for query %s (idle: %d ms). Scheduling retry.", queryId, idleTime);
-                    scheduler.schedule(() -> checkAndSignalEos(queryId), 500, TimeUnit.MILLISECONDS);
+                if (idleTime < 100) {
+                    log.debug("EOS check deferred for query %s (stabilizing: %d ms)", queryId, idleTime);
+                    scheduler.schedule(() -> checkAndSignalEos(queryId), 100, TimeUnit.MILLISECONDS);
                     return;
                 }
 
                 try {
                     queue.put(BatchContainer.endOfStream());
                     eosSignaled = true;
-                    log.info("Signaled end of stream for query %s (confirmed: All sockets closed, JDBC finished, and idle > 500ms)", queryId);
+                    log.info("Signaled end of stream for query %s (connections completed, data in buffer)", queryId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            } else if (jdbcFinished && !hadAnyConnections) {
+                // Edge case: JDBC finished but no socket connections ever arrived
+                // This could happen for queries that return no data, or network issues
+                long now = System.currentTimeMillis();
+                long timeSinceCreation = now - createdAt;
+                
+                // Wait up to 5 seconds for connections, then give up
+                if (timeSinceCreation < 5000) {
+                    log.debug("EOS check deferred for query %s (waiting for connections, age: %d ms)", queryId, timeSinceCreation);
+                    scheduler.schedule(() -> checkAndSignalEos(queryId), 500, TimeUnit.MILLISECONDS);
+                    return;
+                }
+                
+                // No connections after 5 seconds - assume query returned no data
+                try {
+                    queue.put(BatchContainer.endOfStream());
+                    eosSignaled = true;
+                    log.info("Signaled end of stream for query %s (no connections received, assuming empty result)", queryId);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             } else {
-                log.debug("EOS check for query %s: jdbcFinished=%b, activeConnections=%d", 
-                        queryId, jdbcFinished, activeConnections.get());
+                log.debug("EOS check for query %s: jdbcFinished=%b, activeConnections=%d, hadConnections=%b", 
+                        queryId, jdbcFinished, activeConnections.get(), hadAnyConnections);
             }
         }
         
@@ -137,9 +165,11 @@ public class DataBufferRegistry {
                 BatchContainer container = buffer.queue.poll();
                 if (container != null && !container.isEndOfStream()) {
                     try {
-                        container.root().close();
+                    // Page doesn't need explicit closing like Arrow
+                    // But if Page had native resources they would be released here
+                    container = null;
                     } catch (Exception e) {
-                        log.warn("Error closing Arrow root during cleanup for query %s: %s", queryId, e.getMessage());
+                        log.warn("Error during cleanup for query %s: %s", queryId, e.getMessage());
                     }
                 }
             }
@@ -161,6 +191,7 @@ public class DataBufferRegistry {
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
             buffer.updateActivity();
+            buffer.hadAnyConnections = true;  // Mark that we received at least one connection
             int count = buffer.activeConnections.incrementAndGet();
             log.debug("Incremented connections for query %s: now %d", queryId, count);
         }
@@ -192,20 +223,26 @@ public class DataBufferRegistry {
         return queryBuffers.containsKey(queryId);
     }
 
-    public static void pushData(String queryId, VectorSchemaRoot root) {
+    public static void registerSchema(String queryId, List<Type> types) {
+        schemaRegistry.put(queryId, types);
+        log.info("Registered schema types for query %s: %s", queryId, types);
+    }
+
+    public static List<Type> getSchema(String queryId) {
+        return schemaRegistry.get(queryId);
+    }
+
+    public static void pushData(String queryId, Page page) {
         registerQuery(queryId);
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
             buffer.updateActivity();
             try {
-                log.debug("Pushing batch with %d rows for query %s", root.getRowCount(), queryId);
-                buffer.queue.put(BatchContainer.of(root));
+                // log.debug("Pushing batch with %d rows for query %s", page.getPositionCount(), queryId);
+                buffer.queue.put(BatchContainer.of(page));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                root.close();
             }
-        } else {
-            root.close();
         }
     }
 
