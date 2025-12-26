@@ -232,8 +232,10 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
         strcpy(params->query_id, env ? env : "default-query");
     }
 
-    /* Select IP based on AMP ID for load balancing */
-    INTEGER amp_id = 0; FNC_TblOpGetUniqID(&amp_id);
+    /* Select IP based on process ID for load balancing.
+     * Each AMP vproc runs as a separate process with unique PID.
+     * FNC_TblOpGetUniqID may return same value for all AMPs. */
+    INTEGER amp_id = (INTEGER)getpid();
     char *ips[128]; int ip_count = 0;
     char *saveptr;
     char *token = strtok_r(target_ips, ",", &saveptr);
@@ -499,7 +501,7 @@ send_status:
     rr = stats.rows_processed; rb = stats.bytes_sent; rn = stats.null_count; rba = stats.batches_sent; rc = tic;
     int char_len;
     if (stats.error_code == 0) {
-        char_len = snprintf(rs + 2, 256, "[%s:%d] SUCCESS (Query: %s)", params.bridge_host, params.bridge_port, params.query_id);
+        char_len = snprintf(rs + 2, 256, "[%s:%d] AMP:%d PID:%d SUCCESS (Query: %s)", params.bridge_host, params.bridge_port, ra, (int)getpid(), params.query_id);
     } else char_len = snprintf(rs + 2, 256, "ERROR %d: %s", stats.error_code, stats.error_message);
     if (char_len > 256) char_len = 256;
     unsigned short slen = (unsigned short)char_len;
