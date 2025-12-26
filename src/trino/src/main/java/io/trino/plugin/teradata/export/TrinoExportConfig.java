@@ -27,6 +27,7 @@ public class TrinoExportConfig {
     private int bufferQueueCapacity = 100;
     private long pagePollTimeoutMs = 500;
     private int splitsPerWorker = 4;
+    private boolean compressionEnabled = false;
 
     // === Dynamic Filtering Settings ===
     private Duration dynamicFilterTimeout = new Duration(10, TimeUnit.SECONDS);
@@ -222,6 +223,16 @@ public class TrinoExportConfig {
     @Config("teradata.export.splits-per-worker")
     public TrinoExportConfig setSplitsPerWorker(int splitsPerWorker) {
         this.splitsPerWorker = splitsPerWorker;
+        return this;
+    }
+
+    public boolean isCompressionEnabled() {
+        return compressionEnabled;
+    }
+
+    @Config("teradata.export.compression-enabled")
+    public TrinoExportConfig setCompressionEnabled(boolean compressionEnabled) {
+        this.compressionEnabled = compressionEnabled;
         return this;
     }
 

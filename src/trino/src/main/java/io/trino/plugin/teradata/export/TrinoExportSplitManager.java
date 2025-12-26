@@ -221,9 +221,9 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         String sql = String.format(
             "SELECT * FROM " + fullUdfName + "(" +
             "  ON (SELECT %s FROM %s%s%s) " +
-            "  ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size) DIMENSION" +
+            "  ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size, CAST(%d AS INTEGER) as compression_enabled) DIMENSION" +
             ") AS export_result", columnList, tableName, whereClause, sampleClause, 
-            targetIps, queryId, config.getSecurityToken() != null ? config.getSecurityToken() : "", config.getBatchSize());
+            targetIps, queryId, config.getSecurityToken() != null ? config.getSecurityToken() : "", config.getBatchSize(), config.isCompressionEnabled() ? 1 : 0);
 
         log.info("Executing Teradata SQL for query %s: %s", queryId, sql);
 

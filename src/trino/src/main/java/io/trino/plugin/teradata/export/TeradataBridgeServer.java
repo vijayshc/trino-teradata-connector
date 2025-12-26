@@ -123,7 +123,12 @@ public class TeradataBridgeServer implements AutoCloseable {
             // Register this connection
             DataBufferRegistry.incrementConnections(queryId);
             incremented = true;
-            
+            // Read Compression Flag
+            boolean compressionEnabled = in.readInt() == 1;
+            if (compressionEnabled) {
+                log.info("Compression enabled for query %s", queryId);
+            }
+
             // Read Schema JSON
             int schemaLen = in.readInt();
             byte[] schemaBytes = new byte[schemaLen];
@@ -134,7 +139,9 @@ public class TeradataBridgeServer implements AutoCloseable {
             Schema arrowSchema = createArrowSchema(columns);
             
             int totalRows = 0;
-            
+            java.util.zip.Inflater inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
+            byte[] decompressionBuffer = compressionEnabled ? new byte[64 * 1024 * 1024] : null;
+
             // Read batches until end of stream
             while (true) {
                 int batchLen = in.readInt();
@@ -146,7 +153,15 @@ public class TeradataBridgeServer implements AutoCloseable {
                 byte[] batchData = new byte[batchLen];
                 in.readFully(batchData);
                 
-                VectorSchemaRoot root = parseBatch(batchData, columns, arrowSchema);
+                byte[] processedData = batchData;
+                if (compressionEnabled) {
+                    inflater.reset();
+                    inflater.setInput(batchData);
+                    int decompressedLen = inflater.inflate(decompressionBuffer);
+                    processedData = java.util.Arrays.copyOf(decompressionBuffer, decompressedLen);
+                }
+
+                VectorSchemaRoot root = parseBatch(processedData, columns, arrowSchema);
                 totalRows += root.getRowCount();
                 DataBufferRegistry.pushData(queryId, root);
             }

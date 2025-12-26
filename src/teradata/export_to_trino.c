@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <zlib.h>
 #include "sqltypes_td.h"
 
 /* Real Teradata Internal Data Type Codes confirmed by binary diagnostics */
@@ -37,6 +38,7 @@ typedef struct {
     char query_id[256];
     char security_token[256];
     int batch_size;
+    int compression_enabled;
 } ExportParams_t;
 
 typedef struct {
@@ -103,6 +105,31 @@ static long long timestamp_to_micros(void *val) {
     return (long long)days * 86400000000LL + (long long)(hour % 24) * 3600000000LL + (long long)(min % 60) * 60000000LL + (long long)s_scaled;
 }
 
+static int send_batch_to_bridge(int sock_fd, unsigned char *bb, int batch_offset, int rows, int compression_enabled) {
+    write_uint32(bb, rows);
+    if (!compression_enabled) {
+        unsigned char lb[4]; write_uint32(lb, batch_offset);
+        if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, bb, batch_offset, 0) < 0) return -1;
+        return 0;
+    }
+    
+    /* Compression path using zlib */
+    unsigned long dest_len = compressBound(batch_offset);
+    unsigned char *dest = (unsigned char *)FNC_malloc(dest_len);
+    if (!dest) return -1;
+    
+    if (compress(dest, &dest_len, bb, batch_offset) != Z_OK) {
+        FNC_free(dest); return -1;
+    }
+    
+    unsigned char lb[4]; write_uint32(lb, (unsigned int)dest_len);
+    if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, dest, dest_len, 0) < 0) {
+        FNC_free(dest); return -1;
+    }
+    FNC_free(dest);
+    return 0;
+}
+
 static int write_unicode_to_utf8(unsigned char *buf, const unsigned char *val, int bytes) {
     int i = 0, j = 0;
     unsigned char *out = buf + 2;
@@ -133,7 +160,7 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
 
     if (param_stream && FNC_TblOpRead(param_stream) == TBLOP_SUCCESS) {
         int c;
-        for (c = 0; c < 4; c++) {
+        for (c = 0; c < 5; c++) {
             if (c >= FNC_TblOpGetColCount(1, ISINPUT)) break;
             void *val = param_stream->row->columnptr[c];
             if (!val || TBLOPISNULL(param_stream->row->indicators, c)) continue;
@@ -142,6 +169,12 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
                 int bs = 0;
                 memcpy(&bs, val, 4);
                 if (bs > 0) params->batch_size = bs;
+                continue;
+            }
+            if (c == 4) {
+                int ce = 0;
+                memcpy(&ce, val, 4);
+                params->compression_enabled = ce;
                 continue;
             }
 
@@ -343,6 +376,9 @@ void ExportToTrino(void) {
     /* 2. Query ID */
     int ql = strlen(params.query_id);
     ho += write_uint32(ph + ho, ql); memcpy(ph+ho, params.query_id, ql); ho += ql;
+
+    /* 3. Compression Enabled Flag */
+    ho += write_uint32(ph + ho, params.compression_enabled);
     
     /* Allocate enough space for potentially large column metadata JSON */
     int sj_size = tic * 256 + 128;
@@ -443,8 +479,7 @@ void ExportToTrino(void) {
         /* Safety check: ensure we don't overflow bb even with wide rows. 
            Max Teradata row is 1MB, so we check for 1MB safety margin. */
         if (rows_in_batch >= params.batch_size || batch_offset > BUFFER_SIZE - 1048576) {
-            write_uint32(bb, rows_in_batch); unsigned char lb[4]; write_uint32(lb, batch_offset);
-            if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, bb, batch_offset, 0) < 0) {
+            if (send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_enabled) < 0) {
                 stats.error_code = 1004; strcpy(stats.error_message, "Batch send failed"); break;
             }
             stats.batches_sent++; stats.bytes_sent += batch_offset;
@@ -452,8 +487,7 @@ void ExportToTrino(void) {
         }
     }
     if (rows_in_batch > 0 && stats.error_code == 0) {
-        write_uint32(bb, rows_in_batch); unsigned char lb[4]; write_uint32(lb, batch_offset);
-        send(sock_fd, lb, 4, 0); send(sock_fd, bb, batch_offset, 0); 
+        send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_enabled);
         stats.batches_sent++; stats.bytes_sent += batch_offset;
     }
     unsigned char emsg[4] = {0,0,0,0}; send(sock_fd, emsg, 4, 0); 
