@@ -27,17 +27,7 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
         log.info("Listing schema names from Teradata...");
         List<String> schemas = new ArrayList<>();
         try (Connection conn = getConnection(null)) {
-            // Try catalogs first (databases in Teradata)
-            try (ResultSet rs = conn.getMetaData().getCatalogs()) {
-                while (rs.next()) {
-                    String cat = rs.getString("TABLE_CAT");
-                    if (cat != null && !cat.isEmpty()) {
-                        schemas.add(cat);
-                    }
-                }
-            }
-            
-            // Then try schemas
+            // Use schemas only (Databases in Teradata are mapped here)
             try (ResultSet rs = conn.getMetaData().getSchemas()) {
                 while (rs.next()) {
                     String schem = rs.getString("TABLE_SCHEM");
@@ -108,19 +98,7 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
 
 
     private void fetchColumns(Connection conn, String schema, String table, List<io.trino.spi.connector.ColumnMetadata> columns) throws Exception {
-         // Try catalog-based (DatabaseName in Catalog)
-         try (ResultSet rs = conn.getMetaData().getColumns(schema, null, table, null)) {
-             while (rs.next()) {
-                 String columnName = rs.getString("COLUMN_NAME");
-                 int dataType = rs.getInt("DATA_TYPE");
-                 int precision = rs.getInt("COLUMN_SIZE");
-                 int scale = rs.getInt("DECIMAL_DIGITS");
-                 columns.add(new io.trino.spi.connector.ColumnMetadata(columnName, mapJdbcTypeToTrino(dataType, precision, scale)));
-             }
-         }
-         if (!columns.isEmpty()) return;
-
-         // Try schema-based
+         // Use schema-based (TABLE_SCHEM in Teradata JDBC)
          try (ResultSet rs = conn.getMetaData().getColumns(null, schema, table, null)) {
              while (rs.next()) {
                  String columnName = rs.getString("COLUMN_NAME");
@@ -138,19 +116,11 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
         log.info("Listing tables for schema %s", schema);
         List<io.trino.spi.connector.SchemaTableName> tables = new ArrayList<>();
         try (Connection conn = getConnection(null)) {
-            // Try as catalog
-            try (ResultSet rs = conn.getMetaData().getTables(schema, null, null, new String[]{"TABLE", "VIEW"})) {
+            // Use schema-based only
+            try (ResultSet rs = conn.getMetaData().getTables(null, schema, null, new String[]{"TABLE", "VIEW"})) {
                 while (rs.next()) {
-                    tables.add(new io.trino.spi.connector.SchemaTableName(schema, rs.getString("TABLE_NAME")));
-                }
-            }
-            // Try as schema
-            if (tables.isEmpty()) {
-                try (ResultSet rs = conn.getMetaData().getTables(null, schema, null, new String[]{"TABLE", "VIEW"})) {
-                    while (rs.next()) {
-                        String realSchema = rs.getString("TABLE_SCHEM");
-                        tables.add(new io.trino.spi.connector.SchemaTableName(realSchema != null ? realSchema : schema, rs.getString("TABLE_NAME")));
-                    }
+                    String realSchema = rs.getString("TABLE_SCHEM");
+                    tables.add(new io.trino.spi.connector.SchemaTableName(realSchema != null ? realSchema : schema, rs.getString("TABLE_NAME")));
                 }
             }
         } catch (Exception e) {
