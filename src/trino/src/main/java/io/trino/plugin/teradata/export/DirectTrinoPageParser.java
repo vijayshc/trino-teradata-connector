@@ -169,47 +169,32 @@ public final class DirectTrinoPageParser {
                 }
             }
             case "DECIMAL_LONG" -> {
-                byte[] bytes = new byte[16];
-                buf.get(bytes);
                 if (trinoType instanceof DecimalType decimalType) {
-                    // Convert to Int128
-                    // Note: Teradata sends BigEndian or LittleEndian? 
-                    // Based on previous code in TrinoExportPageSource, we might need reversing if it's LE.
-                    // But TeradataBridgeServer was reading it into FixedSizeBinaryVector(16) without reversing.
-                    // Let's assume standard BigEndian for now, but watch out.
-                    // Wait, Trino Int128.fromBigEndian expects BigEndian.
-                    // If the C bridge sends it as is, we should be careful.
-                    // Standard Java ByteBuffer is BigEndian.
-                    // Assuming C bridge writes it in network order (BigEndian).
+                    byte[] bytes = new byte[16];
+                    buf.get(bytes);
                     decimalType.writeObject(builder, Int128.fromBigEndian(bytes));
                 } else {
-                    // Schema mismatch fallback
-                     builder.appendNull(); 
+                    buf.position(buf.position() + 16);
+                    builder.appendNull(); 
                 }
             }
             default -> {
                 // VARCHAR or Fallback
                 int len = buf.getShort() & 0xFFFF;
-                // Avoid allocating a byte array if possible, but we need to create a Slice.
-                // Slices.wrappedBuffer creates a view, but we are reusing the 'data' array via ByteBuffer?
-                // Actually 'buf' wraps 'data'. Slices.wrappedBuffer(data, position, len) would be zero-copy!
-                
-                // Using Slices.utf8Slice(String) allocates a String then bytes. 
-                // Better: Slices.wrappedBuffer(buf.array(), buf.arrayOffset() + buf.position(), len)
-                // But we must advance buffer.
-                
+                if (len == 0) {
+                    VARCHAR.writeSlice(builder, io.airlift.slice.Slices.EMPTY_SLICE);
+                    return;
+                }
+
                 if (buf.hasArray()) {
-                    // Zero-copy Slice creation (if trinoType supports it)
-                    // But wait, VARCHAR.writeSlice requires a Slice.
-                    // We can just read the bytes.
-                    byte[] strBytes = new byte[len];
-                    buf.get(strBytes);
-                    // For now, use the safe string path to match utf8 expectations
-                    VARCHAR.writeSlice(builder, Slices.utf8Slice(new String(strBytes, StandardCharsets.UTF_8)));
+                    // ZERO-ALLOCATION: Use Slice view of the underlying buffer array
+                    io.airlift.slice.Slice slice = io.airlift.slice.Slices.wrappedBuffer(buf.array(), buf.arrayOffset() + buf.position(), len);
+                    VARCHAR.writeSlice(builder, slice);
+                    buf.position(buf.position() + len);
                 } else {
                     byte[] strBytes = new byte[len];
                     buf.get(strBytes);
-                    VARCHAR.writeSlice(builder, Slices.utf8Slice(new String(strBytes, StandardCharsets.UTF_8)));
+                    VARCHAR.writeSlice(builder, io.airlift.slice.Slices.wrappedBuffer(strBytes));
                 }
             }
         }

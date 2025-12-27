@@ -146,12 +146,17 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         String dynamicToken = UUID.randomUUID().toString();
         DataBufferRegistry.registerDynamicToken(splitId, dynamicToken);
         
+        String compressionAlgorithmName = "NONE";
+        if (config.isCompressionEnabled()) {
+            compressionAlgorithmName = config.getCompressionAlgorithm().name();
+        }
+
         String teradataSql = String.format(
                 "SELECT * FROM %s.%s(" +
                 "  ON (%s)" +
-                "   ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size, CAST(%d AS INTEGER) as compression_enabled) DIMENSION" +
+                "   ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size, CAST('%s' AS VARCHAR(20)) as compression_algorithm) DIMENSION" +
                 ") AS export_result", 
-                config.getUdfDatabase(), config.getUdfName(), innerQuery, targetIps, splitId, dynamicToken, config.getBatchSize(), config.isCompressionEnabled() ? 1 : 0);
+                config.getUdfDatabase(), config.getUdfName(), innerQuery, targetIps, splitId, dynamicToken, config.getBatchSize(), compressionAlgorithmName);
 
         // SECURITY: Mask the dynamic token in logged SQL
         String logSql = teradataSql.replace(dynamicToken, "***DYNAMIC_TOKEN***");

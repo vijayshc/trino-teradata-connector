@@ -22,11 +22,9 @@ public final class PerformanceProfiler {
         // Phase timings (nanoseconds for precision)
         public final AtomicLong networkReadNanos = new AtomicLong(0);
         public final AtomicLong decompressionNanos = new AtomicLong(0);
-        public final AtomicLong arrowParsingNanos = new AtomicLong(0);
+        public final AtomicLong directParsingNanos = new AtomicLong(0);
         public final AtomicLong queuePushNanos = new AtomicLong(0);
         public final AtomicLong queuePollNanos = new AtomicLong(0);
-        public final AtomicLong pageConversionNanos = new AtomicLong(0);
-        public final AtomicLong trinoProcessingNanos = new AtomicLong(0);
 
         // Counters
         public final AtomicLong batchCount = new AtomicLong(0);
@@ -73,10 +71,10 @@ public final class PerformanceProfiler {
         }
     }
 
-    public static void recordArrowParsing(String queryId, long nanos, int rows) {
+    public static void recordDirectParsing(String queryId, long nanos, int rows) {
         QueryProfile p = get(queryId);
         if (p != null) {
-            p.arrowParsingNanos.addAndGet(nanos);
+            p.directParsingNanos.addAndGet(nanos);
             p.rowCount.addAndGet(rows);
             p.batchCount.incrementAndGet();
             if (p.firstBatchTimeMs == 0) {
@@ -102,19 +100,7 @@ public final class PerformanceProfiler {
         }
     }
 
-    public static void recordPageConversion(String queryId, long nanos) {
-        QueryProfile p = get(queryId);
-        if (p != null) {
-            p.pageConversionNanos.addAndGet(nanos);
-        }
-    }
 
-    public static void recordTrinoProcessing(String queryId, long nanos) {
-        QueryProfile p = get(queryId);
-        if (p != null) {
-            p.trinoProcessingNanos.addAndGet(nanos);
-        }
-    }
 
     /**
      * Generate and log a detailed profile summary for a query.
@@ -129,13 +115,11 @@ public final class PerformanceProfiler {
         // Convert nanos to millis
         double networkMs = p.networkReadNanos.get() / 1_000_000.0;
         double decompressMs = p.decompressionNanos.get() / 1_000_000.0;
-        double arrowMs = p.arrowParsingNanos.get() / 1_000_000.0;
+        double directParseMs = p.directParsingNanos.get() / 1_000_000.0;
         double queuePushMs = p.queuePushNanos.get() / 1_000_000.0;
         double queuePollMs = p.queuePollNanos.get() / 1_000_000.0;
-        double pageConvMs = p.pageConversionNanos.get() / 1_000_000.0;
-        double trinoMs = p.trinoProcessingNanos.get() / 1_000_000.0;
 
-        double totalProfiledMs = networkMs + decompressMs + arrowMs + queuePushMs + queuePollMs + pageConvMs + trinoMs;
+        double totalProfiledMs = networkMs + decompressMs + directParseMs + queuePushMs + queuePollMs;
         double overheadMs = totalTimeMs - totalProfiledMs;
 
         // Calculate throughput
@@ -147,11 +131,9 @@ public final class PerformanceProfiler {
         // Calculate percentages
         double networkPct = totalTimeMs > 0 ? (networkMs / totalTimeMs * 100) : 0;
         double decompressPct = totalTimeMs > 0 ? (decompressMs / totalTimeMs * 100) : 0;
-        double arrowPct = totalTimeMs > 0 ? (arrowMs / totalTimeMs * 100) : 0;
+        double directParsePct = totalTimeMs > 0 ? (directParseMs / totalTimeMs * 100) : 0;
         double queuePushPct = totalTimeMs > 0 ? (queuePushMs / totalTimeMs * 100) : 0;
         double queuePollPct = totalTimeMs > 0 ? (queuePollMs / totalTimeMs * 100) : 0;
-        double pageConvPct = totalTimeMs > 0 ? (pageConvMs / totalTimeMs * 100) : 0;
-        double trinoPct = totalTimeMs > 0 ? (trinoMs / totalTimeMs * 100) : 0;
 
         StringBuilder sb = new StringBuilder();
         sb.append("\n");
@@ -173,18 +155,14 @@ public final class PerformanceProfiler {
         sb.append("╠══════════════════════════════════════════════════════════════════════════════╣\n");
         sb.append(String.format("║   1. Network I/O (socket read)            %,10.1f      %5.1f%%   %s    ║\n", 
             networkMs, networkPct, getBar(networkPct)));
-        sb.append(String.format("║   2. Decompression (zlib inflate)         %,10.1f      %5.1f%%   %s    ║\n", 
+        sb.append(String.format("║   2. Decompression (LZ4/ZLIB/None)        %,10.1f      %5.1f%%   %s    ║\n", 
             decompressMs, decompressPct, getBar(decompressPct)));
-        sb.append(String.format("║   3. Arrow/Binary Parsing                 %,10.1f      %5.1f%%   %s    ║\n", 
-            arrowMs, arrowPct, getBar(arrowPct)));
+        sb.append(String.format("║   3. Direct Binary Parsing (Zero-Arrow)   %,10.1f      %5.1f%%   %s    ║\n", 
+            directParseMs, directParsePct, getBar(directParsePct)));
         sb.append(String.format("║   4. Queue Push (producer wait)           %,10.1f      %5.1f%%   %s    ║\n", 
             queuePushMs, queuePushPct, getBar(queuePushPct)));
         sb.append(String.format("║   5. Queue Poll (consumer wait)           %,10.1f      %5.1f%%   %s    ║\n", 
             queuePollMs, queuePollPct, getBar(queuePollPct)));
-        sb.append(String.format("║   6. Page Conversion (Arrow→Trino)        %,10.1f      %5.1f%%   %s    ║\n", 
-            pageConvMs, pageConvPct, getBar(pageConvPct)));
-        sb.append(String.format("║   7. Trino Processing (getNextPage)       %,10.1f      %5.1f%%   %s    ║\n", 
-            trinoMs, trinoPct, getBar(trinoPct)));
         sb.append("╠══════════════════════════════════════════════════════════════════════════════╣\n");
         sb.append(String.format("║   Total Profiled:                         %,10.1f ms                   ║\n", totalProfiledMs));
         sb.append(String.format("║   Overhead (unprofiled):                  %,10.1f ms                   ║\n", overheadMs));
@@ -198,8 +176,8 @@ public final class PerformanceProfiler {
         // Bottleneck analysis
         String bottleneck = "Unknown";
         String recommendation = "";
-        double maxPct = Math.max(networkPct, Math.max(decompressPct, Math.max(arrowPct, 
-                        Math.max(pageConvPct, Math.max(queuePollPct, queuePushPct)))));
+        double maxPct = Math.max(networkPct, Math.max(decompressPct, Math.max(directParsePct, 
+                        Math.max(queuePollPct, queuePushPct))));
         
         if (networkPct == maxPct && networkPct > 20) {
             bottleneck = "NETWORK I/O";
@@ -207,18 +185,12 @@ public final class PerformanceProfiler {
         } else if (decompressPct == maxPct && decompressPct > 20) {
             bottleneck = "DECOMPRESSION";
             recommendation = "Consider LZ4 compression (requires UDF change) or disable compression";
-        } else if (arrowPct == maxPct && arrowPct > 20) {
-            bottleneck = "PARSING";
-            recommendation = "Reduce column count or use simpler data types";
+        } else if (directParsePct == maxPct && directParsePct > 20) {
+            bottleneck = "DIRECT PARSING";
+            recommendation = "Check for complex expressions or many columns";
         } else if (queuePushPct == maxPct && queuePushPct > 20) {
             bottleneck = "QUEUE FULL (consumer slow)";
-            recommendation = "Increase splits-per-worker or buffer-queue-capacity";
-        } else if (queuePollPct == maxPct && queuePollPct > 20) {
-            bottleneck = "QUEUE EMPTY (producer slow)";
-            recommendation = "Network or Teradata is the bottleneck";
-        } else if (pageConvPct == maxPct && pageConvPct > 20) {
-            bottleneck = "PAGE CONVERSION";
-            recommendation = "Use direct parsing (skip Arrow) for simple types";
+            recommendation = "Trino is processing pages slower than the bridge can parse them";
         } else if (p.networkWaitCount.get() > p.batchCount.get()) {
             bottleneck = "NETWORK/TERADATA LATENCY";
             recommendation = "Data arrival is slower than processing; check Teradata side";

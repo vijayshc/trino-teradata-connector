@@ -12,6 +12,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.Inflater;
+import io.airlift.compress.lz4.Lz4Decompressor;
 import java.util.zip.DataFormatException;
 
 /**
@@ -26,7 +27,7 @@ public final class AsyncDecompressionPipeline {
 
     private final String queryId;
     private final List<DirectTrinoPageParser.ColumnSpec> columns;
-    private final boolean compressionEnabled;
+    private final int compressionType; // 0=None, 1=ZLIB, 2=LZ4
     private final ByteBufferPool bufferPool;
 
     // Queues for async pipeline
@@ -51,13 +52,13 @@ public final class AsyncDecompressionPipeline {
     public AsyncDecompressionPipeline(
             String queryId,
             List<DirectTrinoPageParser.ColumnSpec> columns,
-            boolean compressionEnabled,
+            int compressionType,
             int queueCapacity,
             int decompressorThreads) {
 
         this.queryId = queryId;
         this.columns = columns;
-        this.compressionEnabled = compressionEnabled;
+        this.compressionType = compressionType;
         this.compressedQueue = new ArrayBlockingQueue<>(queueCapacity);
         this.bufferPool = new ByteBufferPool(decompressorThreads * 2, 64 * 1024 * 1024);
         this.workerLatch = new CountDownLatch(decompressorThreads);
@@ -116,7 +117,8 @@ public final class AsyncDecompressionPipeline {
         
         try {
             // Create own Inflater instance for this worker
-            inflater = compressionEnabled ? new Inflater() : null;
+            inflater = (compressionType == 1) ? new Inflater() : null;
+            Lz4Decompressor lz4Decompressor = (compressionType == 2) ? new Lz4Decompressor() : null;
             
             while (!finished) {
                 CompressedBatch batch = compressedQueue.poll(100, TimeUnit.MILLISECONDS);
@@ -132,12 +134,17 @@ public final class AsyncDecompressionPipeline {
                 byte[] decompressed;
                 int decompressedLen;
 
-                if (compressionEnabled) {
+                if (compressionType == 1) { /* ZLIB */
                     inflater.reset();
                     inflater.setInput(batch.data, 0, batch.length);
                     decompressedLen = inflater.inflate(decompressionBuffer);
                     decompressed = decompressionBuffer;
-                } else {
+                } else if (compressionType == 2) { /* LZ4 */
+                    // LZ4 decompression requires destination size or we can use the aircompressor version
+                    // The aircompressor LZ4Decompressor.decompress(input, inputOffset, inputLength, output, outputOffset, maxOutputLength)
+                    decompressedLen = lz4Decompressor.decompress(batch.data, 0, batch.length, decompressionBuffer, 0, decompressionBuffer.length);
+                    decompressed = decompressionBuffer;
+                } else { /* NONE */
                     decompressed = batch.data;
                     decompressedLen = batch.length;
                 }

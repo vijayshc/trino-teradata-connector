@@ -146,10 +146,13 @@ public class TeradataBridgeServer implements AutoCloseable {
             DataBufferRegistry.incrementConnections(queryId);
             incremented = true;
             
-            // Read Compression Flag
-            boolean compressionEnabled = in.readInt() == 1;
-            if (compressionEnabled) {
-                log.info("Compression enabled for query %s", queryId);
+            // Read Compression Type
+            int compressionType = in.readInt();
+            String algo = (compressionType == 2) ? "LZ4" : (compressionType == 1) ? "ZLIB" : "NONE";
+            if (compressionType != 0) {
+                log.info("AUTHENTICATION SUCCESS: Query %s using compression %s", queryId, algo);
+            } else {
+                log.info("AUTHENTICATION SUCCESS: Query %s with compression DISABLED", queryId);
             }
 
             // Read Schema JSON (for verification and name matching)
@@ -159,14 +162,14 @@ public class TeradataBridgeServer implements AutoCloseable {
             String schemaJson = new String(schemaBytes, StandardCharsets.UTF_8);
             
             // Fetch registered Trino Types (Critical for direct parsing)
-            List<Type> trinoTypes = DataBufferRegistry.getSchema(queryId);
-            if (trinoTypes == null) {
-                // Retry once after a delay to handle race condition where Split hasn't registered schema yet
-                Thread.sleep(1000);
+            List<Type> trinoTypes = null;
+            for (int i = 0; i < 20; i++) { // Wait up to 10 seconds (20 * 500ms)
                 trinoTypes = DataBufferRegistry.getSchema(queryId);
-                if (trinoTypes == null) {
-                    throw new IllegalStateException("No Trino schema registered for query " + queryId + ". PageSource implementation must register schema before data transfer.");
-                }
+                if (trinoTypes != null) break;
+                Thread.sleep(500);
+            }
+            if (trinoTypes == null) {
+                throw new IllegalStateException("No Trino schema registered for query " + queryId + ". PageSource implementation must register schema before data transfer.");
             }
             
             // Create Column Specs using the existing helper method
@@ -177,8 +180,9 @@ public class TeradataBridgeServer implements AutoCloseable {
             
             // Synchronous processing - create decompression buffer with dynamic sizing
             // Start with 4MB and grow if needed (reduces GC pressure vs fixed 64MB)
-            inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
-            byte[] decompressionBuffer = compressionEnabled ? new byte[4 * 1024 * 1024] : null;
+            inflater = (compressionType == 1) ? new java.util.zip.Inflater() : null;
+            io.airlift.compress.lz4.Lz4Decompressor lz4Decompressor = (compressionType == 2) ? new io.airlift.compress.lz4.Lz4Decompressor() : null;
+            byte[] decompressionBuffer = (compressionType != 0) ? new byte[4 * 1024 * 1024] : null;
 
             // Read and process batches synchronously until end of stream
             while (true) {
@@ -200,7 +204,7 @@ public class TeradataBridgeServer implements AutoCloseable {
                 byte[] decompressed;
                 int decompressedLen;
                 
-                if (compressionEnabled) {
+                if (compressionType == 1) { /* ZLIB */
                     long decompStart = System.nanoTime();
                     inflater.reset();
                     inflater.setInput(batchData, 0, batchLen);
@@ -222,6 +226,21 @@ public class TeradataBridgeServer implements AutoCloseable {
                     PerformanceProfiler.recordDecompression(queryId, decompEnd - decompStart, decompressedLen);
                     decompressed = decompressionBuffer;
                     decompressedBytes += decompressedLen;
+                } else if (compressionType == 2) { /* LZ4 */
+                    long decompStart = System.nanoTime();
+                    // Estimate decompressed size
+                    int estimatedSize = batchLen * 10;
+                    if (estimatedSize > decompressionBuffer.length) {
+                        int newSize = Math.min(estimatedSize, 64 * 1024 * 1024);
+                        if (newSize > decompressionBuffer.length) {
+                            decompressionBuffer = new byte[newSize];
+                        }
+                    }
+                    decompressedLen = lz4Decompressor.decompress(batchData, 0, batchLen, decompressionBuffer, 0, decompressionBuffer.length);
+                    long decompEnd = System.nanoTime();
+                    PerformanceProfiler.recordDecompression(queryId, decompEnd - decompStart, decompressedLen);
+                    decompressed = decompressionBuffer;
+                    decompressedBytes += decompressedLen;
                 } else {
                     decompressed = batchData;
                     decompressedLen = batchLen;
@@ -235,7 +254,7 @@ public class TeradataBridgeServer implements AutoCloseable {
                 
                 if (page != null && page.getPositionCount() > 0) {
                     totalRows += page.getPositionCount();
-                    PerformanceProfiler.recordArrowParsing(queryId, parseEnd - parseStart, page.getPositionCount());
+                    PerformanceProfiler.recordDirectParsing(queryId, parseEnd - parseStart, page.getPositionCount());
                     
                     // SYNCHRONOUS: Push to buffer in this thread
                     // Data is in buffer BEFORE we move to next batch or decrement connection

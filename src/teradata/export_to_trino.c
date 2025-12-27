@@ -14,6 +14,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <netinet/tcp.h>
+#include "lz4.h"
 #include "sqltypes_td.h"
 
 /* Real Teradata Internal Data Type Codes confirmed by binary diagnostics */
@@ -32,7 +34,7 @@ typedef struct {
     char query_id[256];
     char security_token[256];
     int batch_size;
-    int compression_enabled;
+    int compression_type;
 } ExportParams_t;
 
 typedef struct {
@@ -99,28 +101,34 @@ static long long timestamp_to_micros(void *val) {
     return (long long)days * 86400000000LL + (long long)(hour % 24) * 3600000000LL + (long long)(min % 60) * 60000000LL + (long long)s_scaled;
 }
 
-static int send_batch_to_bridge(int sock_fd, unsigned char *bb, int batch_offset, int rows, int compression_enabled) {
+static int send_batch_to_bridge(int sock_fd, unsigned char *bb, int batch_offset, int rows, int compression_type, unsigned char **dest_ptr, unsigned long *dest_cap) {
     write_uint32(bb, rows);
-    if (!compression_enabled) {
+    if (compression_type == 0) {  /* 0 = None */
         unsigned char lb[4]; write_uint32(lb, batch_offset);
         if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, bb, batch_offset, 0) < 0) return -1;
         return 0;
     }
     
-    /* Compression path using zlib */
-    unsigned long dest_len = compressBound(batch_offset);
-    unsigned char *dest = (unsigned char *)FNC_malloc(dest_len);
-    if (!dest) return -1;
-    
-    if (compress(dest, &dest_len, bb, batch_offset) != Z_OK) {
-        FNC_free(dest); return -1;
+    /* Ensure compression buffer is large enough */
+    unsigned long bound = (compression_type == 2) ? LZ4_compressBound(batch_offset) : compressBound(batch_offset);
+    if (!*dest_ptr || *dest_cap < bound) {
+        if (*dest_ptr) FNC_free(*dest_ptr);
+        *dest_ptr = (unsigned char *)FNC_malloc(bound);
+        if (!*dest_ptr) return -1;
+        *dest_cap = bound;
+    }
+
+    unsigned long actual_len;
+    if (compression_type == 2) { /* 2 = LZ4 */
+        actual_len = LZ4_compress_default((const char*)bb, (char*)*dest_ptr, batch_offset, *dest_cap);
+        if (actual_len <= 0) return -1;
+    } else { /* 1 = ZLIB */
+        actual_len = *dest_cap;
+        if (compress(*dest_ptr, &actual_len, bb, batch_offset) != Z_OK) return -1;
     }
     
-    unsigned char lb[4]; write_uint32(lb, (unsigned int)dest_len);
-    if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, dest, dest_len, 0) < 0) {
-        FNC_free(dest); return -1;
-    }
-    FNC_free(dest);
+    unsigned char lb[4]; write_uint32(lb, (unsigned int)actual_len);
+    if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, *dest_ptr, actual_len, 0) < 0) return -1;
     return 0;
 }
 
@@ -159,21 +167,15 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
             void *val = param_stream->row->columnptr[c];
             if (!val || TBLOPISNULL(param_stream->row->indicators, c)) continue;
             
+            int actual_len = param_stream->row->lengths[c];
+            if (actual_len < 0) continue;
+            
             if (c == 3) {
                 int bs = 0;
                 memcpy(&bs, val, 4);
                 if (bs > 0) params->batch_size = bs;
                 continue;
             }
-            if (c == 4) {
-                int ce = 0;
-                memcpy(&ce, val, 4);
-                params->compression_enabled = ce;
-                continue;
-            }
-
-            int actual_len = param_stream->row->lengths[c];
-            if (actual_len <= 0) continue;
 
             char tmp[1024] = "";
             char *src = (char*)val;
@@ -206,12 +208,17 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
             int len = strlen(tmp);
             if (len > 0) {
                 char *end = tmp + len - 1;
-                while(end >= tmp && (*end == ' ' || *end == '\0')) { *end = '\0'; end--; }
+                while(end >= tmp && (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\0')) { *end = '\0'; end--; }
             }
 
             if (c == 0) { strncpy(params->bridge_host, tmp, 255); params->bridge_host[255] = '\0'; strcpy(target_ips, tmp); }
             else if (c == 1) { strncpy(params->query_id, tmp, 255); params->query_id[255] = '\0'; }
             else if (c == 2) { strncpy(params->security_token, tmp, 255); params->security_token[255] = '\0'; }
+            else if (c == 4) {
+                if (strstr(tmp, "LZ4")) params->compression_type = 2;
+                else if (strstr(tmp, "ZLIB")) params->compression_type = 1;
+                else params->compression_type = 0;
+            }
         }
     }
 
@@ -274,27 +281,23 @@ static int write_hex_string(unsigned char *buf, void *value, int bytesize) {
     return 2 + len;
 }
 
-static int write_decimal_as_string(unsigned char *buf, void *value, int bytesize, int scale) {
-    char str[100], tmp[64];
-    int len = 0, i = 0;
-    unsigned __int128 abs_val; __int128 val = 0;
-    if (bytesize == 1) val = *(__int8_t*)value;
-    else if (bytesize == 2) val = *(__int16_t*)value;
-    else if (bytesize == 4) val = *(__int32_t*)value;
-    else if (bytesize == 8) val = *(__int64_t*)value;
-    else if (bytesize >= 16) memcpy(&val, value, 16);
-    if (val < 0) { str[len++] = '-'; abs_val = (unsigned __int128)(-val); } else abs_val = (unsigned __int128)val;
-    if (abs_val == 0) tmp[i++] = '0';
-    while (abs_val > 0) { tmp[i++] = (char)(abs_val % 10 + '0'); abs_val /= 10; }
-    while (i <= scale) tmp[i++] = '0';
-    int j;
-    for (j = 0; j < i; j++) {
-        if (i - j == scale && scale > 0) str[len++] = '.';
-        str[len++] = tmp[i - 1 - j];
+static int write_decimal_binary(unsigned char *buf, void *value, int bytesize) {
+    if (bytesize <= 8) {
+        long long v = 0;
+        if (bytesize == 1) v = *(__int8_t*)value;
+        else if (bytesize == 2) v = *(__int16_t*)value;
+        else if (bytesize == 4) v = *(__int32_t*)value;
+        else if (bytesize == 8) v = *(long long*)value;
+        return write_int64(buf, v);
+    } else {
+        /* 16-byte decimal, Trino expects Big Endian. Teradata is Little Endian. */
+        unsigned char *p = (unsigned char *)value;
+        int i;
+        for (i = 0; i < 16; i++) {
+            buf[i] = p[15 - i];
+        }
+        return 16;
     }
-    str[len] = '\0';
-    write_uint16(buf, (short)len); memcpy(buf + 2, str, len);
-    return 2 + len;
 }
 
 void ExportToTrino_contract(INTEGER *Result, int *indicator_Result, char sqlstate[6], SQL_TEXT extname[129], SQL_TEXT specific_name[129], SQL_TEXT error_message[257]) {
@@ -328,6 +331,8 @@ void ExportToTrino(void) {
     ExportParams_t params;
     ExportStats_t stats;
     unsigned char *bb = NULL;
+    unsigned char *dest = NULL;
+    unsigned long dest_cap = 0;
     int incount, outcount;
 
     memset(&stats, 0, sizeof(stats));
@@ -361,6 +366,12 @@ void ExportToTrino(void) {
         goto send_status;
     }
 
+    /* Optimization D: Socket Resource Management */
+    int flag = 1;
+    setsockopt(sock_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    int sndbuf = 4194304; /* 4MB */
+    setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(int));
+
     unsigned char ph[4096]; int ho = 0; 
     
     /* 1. Security Token (if configured) */
@@ -375,8 +386,8 @@ void ExportToTrino(void) {
     int ql = strlen(params.query_id);
     ho += write_uint32(ph + ho, ql); memcpy(ph+ho, params.query_id, ql); ho += ql;
 
-    /* 3. Compression Enabled Flag */
-    ho += write_uint32(ph + ho, params.compression_enabled);
+    /* 3. Compression Type Flag */
+    ho += write_uint32(ph + ho, params.compression_type);
     
     /* Allocate enough space for potentially large column metadata JSON */
     int sj_size = tic * 256 + 128;
@@ -457,22 +468,9 @@ void ExportToTrino(void) {
                 } else if (dt == TIMESTAMP_DT) {
                     batch_offset += write_int64(bb + batch_offset, timestamp_to_micros(val));
                 } else if (dt == DECIMAL1_DT || dt == DECIMAL2_DT || dt == DECIMAL4_DT || dt == DECIMAL8_DT || dt == 14) { /* 14=TD_DECIMAL */
-                    int bsize = iCols->column_types[col].bytesize;
-                    if (bsize <= 8) {
-                        long long v = 0;
-                        if (bsize == 1) v = *(__int8_t*)val;
-                        else if (bsize == 2) v = *(__int16_t*)val;
-                        else if (bsize == 4) v = *(__int32_t*)val;
-                        else if (bsize == 8) v = *(long long*)val;
-                        batch_offset += write_int64(bb + batch_offset, v);
-                    } else {
-                        /* 16-byte decimal */
-                        memcpy(bb + batch_offset, val, 16);
-                        batch_offset += 16;
-                    }
+                    batch_offset += write_decimal_binary(bb + batch_offset, val, iCols->column_types[col].bytesize);
                 } else if (dt == DECIMAL16_DT) {
-                        memcpy(bb + batch_offset, val, 16);
-                        batch_offset += 16;
+                    batch_offset += write_decimal_binary(bb + batch_offset, val, 16);
                 } else {
                     batch_offset += write_hex_string(bb + batch_offset, val, iCols->column_types[col].bytesize);
                 }
@@ -481,7 +479,7 @@ void ExportToTrino(void) {
         /* Safety check: ensure we don't overflow bb even with wide rows. 
            Max Teradata row is 1MB, so we check for 1MB safety margin. */
         if (rows_in_batch >= params.batch_size || batch_offset > BUFFER_SIZE - 1048576) {
-            if (send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_enabled) < 0) {
+            if (send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_type, &dest, &dest_cap) < 0) {
                 stats.error_code = 1004; strcpy(stats.error_message, "Batch send failed"); break;
             }
             stats.batches_sent++; stats.bytes_sent += batch_offset;
@@ -489,7 +487,7 @@ void ExportToTrino(void) {
         }
     }
     if (rows_in_batch > 0 && stats.error_code == 0) {
-        send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_enabled);
+        send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_type, &dest, &dest_cap);
         stats.batches_sent++; stats.bytes_sent += batch_offset;
     }
     unsigned char emsg[4] = {0,0,0,0}; send(sock_fd, emsg, 4, 0); 
@@ -515,6 +513,7 @@ send_status:
     }
     if (iCols) FNC_free(iCols);
     if (bb) FNC_free(bb);
+    if (dest) FNC_free(dest);
     if (in) FNC_TblOpClose(in);
     if (param_in) FNC_TblOpClose(param_in);
 }

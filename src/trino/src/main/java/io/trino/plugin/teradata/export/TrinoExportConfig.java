@@ -29,6 +29,11 @@ public class TrinoExportConfig {
     private long pagePollTimeoutMs = 100;   // More aggressive polling
     private int splitsPerWorker = 8;        // Match available CPU cores, not AMPs
     private boolean compressionEnabled = true;  // Enable by default for max throughput
+    private CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.ZLIB;
+    
+    public enum CompressionAlgorithm {
+        ZLIB, LZ4
+    }
 
 
     // === Dynamic Filtering Settings ===
@@ -232,6 +237,16 @@ public class TrinoExportConfig {
     @Config("teradata.export.compression-enabled")
     public TrinoExportConfig setCompressionEnabled(boolean compressionEnabled) {
         this.compressionEnabled = compressionEnabled;
+        return this;
+    }
+
+    public CompressionAlgorithm getCompressionAlgorithm() {
+        return compressionAlgorithm;
+    }
+
+    @Config("teradata.export.compression-algorithm")
+    public TrinoExportConfig setCompressionAlgorithm(CompressionAlgorithm compressionAlgorithm) {
+        this.compressionAlgorithm = compressionAlgorithm;
         return this;
     }
 
