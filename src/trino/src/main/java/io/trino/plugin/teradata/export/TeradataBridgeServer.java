@@ -178,11 +178,11 @@ public class TeradataBridgeServer implements AutoCloseable {
             // Initialize profiler
             PerformanceProfiler.getOrCreate(queryId);
             
-            // Synchronous processing - create decompression buffer with dynamic sizing
-            // Start with 4MB and grow if needed (reduces GC pressure vs fixed 64MB)
+            // Synchronous processing - create decompression buffer with enough space for max Teradata batch (16MB)
+            // Using 32MB to be absolutely safe and avoid reallocations
             inflater = (compressionType == 1) ? new java.util.zip.Inflater() : null;
             io.airlift.compress.lz4.Lz4Decompressor lz4Decompressor = (compressionType == 2) ? new io.airlift.compress.lz4.Lz4Decompressor() : null;
-            byte[] decompressionBuffer = (compressionType != 0) ? new byte[4 * 1024 * 1024] : null;
+            byte[] decompressionBuffer = (compressionType != 0) ? new byte[32 * 1024 * 1024] : null;
 
             // Read and process batches synchronously until end of stream
             while (true) {
@@ -209,16 +209,10 @@ public class TeradataBridgeServer implements AutoCloseable {
                     inflater.reset();
                     inflater.setInput(batchData, 0, batchLen);
                     
-                    // Dynamic buffer growth: if buffer too small, allocate larger one
-                    // Estimate decompressed size (typical ratio 3-10x)
-                    int estimatedSize = batchLen * 10;
-                    if (estimatedSize > decompressionBuffer.length) {
-                        // Cap at 64MB to prevent OOM from malicious/corrupt data
-                        int newSize = Math.min(estimatedSize, 64 * 1024 * 1024);
-                        if (newSize > decompressionBuffer.length) {
-                            log.debug("Growing decompression buffer from %d to %d bytes", decompressionBuffer.length, newSize);
-                            decompressionBuffer = new byte[newSize];
-                        }
+                    // Ensure buffer is large enough for decompression. 
+                    // Max Teradata batch is 16MB, so 32MB should always be enough.
+                    if (decompressionBuffer.length < 32 * 1024 * 1024) {
+                        decompressionBuffer = new byte[32 * 1024 * 1024];
                     }
                     
                     decompressedLen = inflater.inflate(decompressionBuffer);
@@ -228,13 +222,9 @@ public class TeradataBridgeServer implements AutoCloseable {
                     decompressedBytes += decompressedLen;
                 } else if (compressionType == 2) { /* LZ4 */
                     long decompStart = System.nanoTime();
-                    // Estimate decompressed size
-                    int estimatedSize = batchLen * 10;
-                    if (estimatedSize > decompressionBuffer.length) {
-                        int newSize = Math.min(estimatedSize, 64 * 1024 * 1024);
-                        if (newSize > decompressionBuffer.length) {
-                            decompressionBuffer = new byte[newSize];
-                        }
+                    // Ensure buffer is large enough.
+                    if (decompressionBuffer.length < 32 * 1024 * 1024) {
+                        decompressionBuffer = new byte[32 * 1024 * 1024];
                     }
                     decompressedLen = lz4Decompressor.decompress(batchData, 0, batchLen, decompressionBuffer, 0, decompressionBuffer.length);
                     long decompEnd = System.nanoTime();

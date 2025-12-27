@@ -57,6 +57,18 @@ static int write_uint32(unsigned char *buf, unsigned int val) {
     buf[2] = (val >> 8) & 0xFF;  buf[3] = val & 0xFF;
     return 4;
 }
+
+static int send_all(int sock_fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t r = send(sock_fd, p, len, 0);
+        if (r < 0) return -1;
+        if (r == 0) return -1;
+        p += r;
+        len -= r;
+    }
+    return 0;
+}
 static int write_uint16(unsigned char *buf, unsigned short val) {
     buf[0] = (val >> 8) & 0xFF; buf[1] = val & 0xFF;
     return 2;
@@ -105,7 +117,7 @@ static int send_batch_to_bridge(int sock_fd, unsigned char *bb, int batch_offset
     write_uint32(bb, rows);
     if (compression_type == 0) {  /* 0 = None */
         unsigned char lb[4]; write_uint32(lb, batch_offset);
-        if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, bb, batch_offset, 0) < 0) return -1;
+        if (send_all(sock_fd, lb, 4) < 0 || send_all(sock_fd, bb, batch_offset) < 0) return -1;
         return 0;
     }
     
@@ -128,7 +140,7 @@ static int send_batch_to_bridge(int sock_fd, unsigned char *bb, int batch_offset
     }
     
     unsigned char lb[4]; write_uint32(lb, (unsigned int)actual_len);
-    if (send(sock_fd, lb, 4, 0) < 0 || send(sock_fd, *dest_ptr, actual_len, 0) < 0) return -1;
+    if (send_all(sock_fd, lb, 4) < 0 || send_all(sock_fd, *dest_ptr, actual_len) < 0) return -1;
     return 0;
 }
 
@@ -419,7 +431,7 @@ void ExportToTrino(void) {
     }
     strcat(sj, "]}"); int sj_len = strlen(sj);
     ho += write_uint32(ph + ho, sj_len);
-    if (send(sock_fd, ph, ho, 0) < 0 || send(sock_fd, sj, sj_len, 0) < 0) {
+    if (send_all(sock_fd, ph, ho) < 0 || send_all(sock_fd, sj, sj_len) < 0) {
         stats.error_code = 1003; strcpy(stats.error_message, "Handshake send failed"); 
         FNC_free(sj); sj = NULL; goto send_status;
     }
@@ -492,7 +504,7 @@ void ExportToTrino(void) {
         send_batch_to_bridge(sock_fd, bb, batch_offset, rows_in_batch, params.compression_type, &dest, &dest_cap);
         stats.batches_sent++; stats.bytes_sent += batch_offset;
     }
-    unsigned char emsg[4] = {0,0,0,0}; send(sock_fd, emsg, 4, 0); 
+    unsigned char emsg[4] = {0,0,0,0}; send_all(sock_fd, emsg, 4); 
 
 send_status:
     if (sock_fd >= 0) close(sock_fd);
