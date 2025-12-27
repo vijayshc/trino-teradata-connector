@@ -57,12 +57,17 @@ public class DataBufferRegistry {
         volatile long lastActivityTime = System.currentTimeMillis();
         final AtomicInteger activeConsumers = new AtomicInteger(0);
         
+        // Multi-split tracking
+        final AtomicInteger totalFinishedConsumers = new AtomicInteger(0);
+        volatile int expectedConsumers = 1;
+        
         // Error signaling for immediate failure propagation
         volatile Exception queryError = null;
         volatile String errorMessage = null;
 
-        QueryBuffer(int capacity) {
+        QueryBuffer(int capacity, int expectedConsumers) {
             this.queue = new LinkedBlockingQueue<>(capacity);
+            this.expectedConsumers = expectedConsumers;
         }
 
         /**
@@ -96,9 +101,15 @@ public class DataBufferRegistry {
                 }
 
                 try {
-                    queue.put(BatchContainer.endOfStream());
+                    // CRITICAL: Push EOS markers for ALL consumers
+                    // Each PageSource (split) needs its own EOS marker to finish
+                    int consumerCount = Math.max(1, activeConsumers.get());
+                    for (int i = 0; i < consumerCount; i++) {
+                        queue.put(BatchContainer.endOfStream());
+                    }
                     eosSignaled = true;
-                    log.debug("Signaled end of stream for query %s (connections completed, data in buffer)", queryId);
+                    log.debug("Signaled end of stream for query %s (pushed %d EOS markers for %d consumers)", 
+                            queryId, consumerCount, consumerCount);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -117,9 +128,14 @@ public class DataBufferRegistry {
                 
                 // No connections after 5 seconds - assume query returned no data
                 try {
-                    queue.put(BatchContainer.endOfStream());
+                    // Push EOS markers for ALL consumers
+                    int consumerCount = Math.max(1, activeConsumers.get());
+                    for (int i = 0; i < consumerCount; i++) {
+                        queue.put(BatchContainer.endOfStream());
+                    }
                     eosSignaled = true;
-                    log.debug("Signaled end of stream for query %s (no connections received, assuming empty result)", queryId);
+                    log.debug("Signaled end of stream for query %s (no connections received, pushed %d EOS markers)", 
+                            queryId, consumerCount);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -132,9 +148,12 @@ public class DataBufferRegistry {
         synchronized void forceSignalEos(String queryId) {
             if (!eosSignaled) {
                 try {
-                    queue.put(BatchContainer.endOfStream());
+                    int consumerCount = Math.max(1, activeConsumers.get());
+                    for (int i = 0; i < consumerCount; i++) {
+                        queue.put(BatchContainer.endOfStream());
+                    }
                     eosSignaled = true;
-                    log.debug("Force signaled end of stream for query %s", queryId);
+                    log.debug("Force signaled end of stream for query %s (pushed %d EOS markers)", queryId, consumerCount);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -152,9 +171,19 @@ public class DataBufferRegistry {
     }
 
     public static void registerQuery(String queryId) {
-        queryBuffers.computeIfAbsent(queryId, k -> {
-            log.debug("Registered buffer for query %s (capacity: %d)", queryId, bufferQueueCapacity);
-            return new QueryBuffer(bufferQueueCapacity);
+        registerQuery(queryId, 1);
+    }
+
+    public static void registerQuery(String queryId, int expectedConsumers) {
+        queryBuffers.compute(queryId, (k, v) -> {
+            if (v == null) {
+                log.debug("Registered buffer for query %s (capacity: %d, consumers: %d)", queryId, bufferQueueCapacity, expectedConsumers);
+                return new QueryBuffer(bufferQueueCapacity, expectedConsumers);
+            } else {
+                // Buffer exists, update expectation just in case
+                v.expectedConsumers = Math.max(v.expectedConsumers, expectedConsumers);
+                return v;
+            }
         });
     }
 
@@ -162,15 +191,33 @@ public class DataBufferRegistry {
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
             buffer.activeConsumers.incrementAndGet();
+            
+            // CRITICAL: Handle late joiners (lazy split creation)
+            // If EOS was already signaled, this new consumer missed the original EOS push.
+            // We must push a new EOS marker just for this consumer.
+            if (buffer.eosSignaled) {
+                try {
+                    buffer.queue.put(BatchContainer.endOfStream());
+                    log.debug("Late consumer registered for query %s - pushed immediate EOS marker", queryId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Interrupted while pushing EOS for late consumer of query %s", queryId);
+                }
+            }
         }
     }
 
     public static void deregisterQuery(String queryId) {
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
-            int remaining = buffer.activeConsumers.decrementAndGet();
-            if (remaining > 0) {
-                log.debug("Consumer closed for query %s. %d consumers remaining.", queryId, remaining);
+            int remainingActive = buffer.activeConsumers.decrementAndGet();
+            int finished = buffer.totalFinishedConsumers.incrementAndGet();
+            
+            // Only clean up when ALL expected consumers have finished
+            // This handles lazy split execution where activeConsumers might drop to 0 before the next split starts
+            if (finished < buffer.expectedConsumers) {
+                log.debug("Consumer closed for query %s. %d/%d finished. %d active.", 
+                        queryId, finished, buffer.expectedConsumers, remainingActive);
                 return;
             }
             
@@ -180,7 +227,7 @@ public class DataBufferRegistry {
             dynamicTokenRegistry.remove(queryId);
             PerformanceProfiler.clear(queryId);
             
-            log.debug("Deregistered buffer, schema, and profiler for query %s. All consumers closed.", queryId);
+            log.debug("Deregistered buffer, schema, and profiler for query %s. All %d consumers finished.", queryId, finished);
             while (!buffer.queue.isEmpty()) {
                 BatchContainer container = buffer.queue.poll();
                 if (container != null && !container.isEndOfStream()) {

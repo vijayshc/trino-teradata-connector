@@ -7,8 +7,12 @@ import io.trino.spi.predicate.TupleDomain;
 import java.io.DataOutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -29,6 +33,7 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
     private final String trinoUser;
     private final TrinoExportConfig config;
     private final ExecutorService executor;
+    // connectionPool removed
     
     private final AtomicBoolean teradataExecutionStarted = new AtomicBoolean(false);
     private final AtomicBoolean splitsReturned = new AtomicBoolean(false);
@@ -162,23 +167,25 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         String logSql = teradataSql.replace(dynamicToken, "***DYNAMIC_TOKEN***");
         log.info("Executing Teradata SQL for query %s: %s", splitId, logSql);
 
-        try (java.sql.Connection conn = getConnection();
+        // Direct connection (no pool)
+        try (Connection conn = getConnection();
              java.sql.Statement stmt = conn.createStatement();
              java.sql.ResultSet rs = stmt.executeQuery(teradataSql)) {
             while (rs.next()) { }
             log.info("Teradata SQL execution finished successfully for query %s", splitId);
         } catch (Exception e) {
             log.error(e, "Error executing Teradata SQL for query %s", splitId);
-            // PROACTIVE CLEANUP: Clean up immediately on failure instead of waiting for TTL
-            // This prevents memory accumulation when JDBC execution fails before any data flows
             DataBufferRegistry.cleanupOnFailure(splitId);
         } finally {
+            // IMPORTANT: Broadcast BEFORE signaling JDBC finished to avoid race condition
+            // where EOS cleanup removes the token before broadcast retrieves it.
+            // Pass the token directly since we already have it.
+            broadcastJdbcFinishedSignal(dynamicToken);
             DataBufferRegistry.signalJdbcFinished(splitId);
-            broadcastJdbcFinishedSignal();
         }
     }
 
-    private void broadcastJdbcFinishedSignal() {
+    private void broadcastJdbcFinishedSignal(String dynamicToken) {
         if (targetIps == null || targetIps.isEmpty()) return;
         
         String[] ips = targetIps.split(",");
@@ -197,12 +204,13 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
                     
                     socket.setSoTimeout(5000);
                     
-                    // 1. Dynamic Token
-                    String dynamicToken = DataBufferRegistry.getDynamicToken(splitId);
+                    // 1. Dynamic Token (passed directly to avoid race condition with cleanup)
                     if (dynamicToken != null) {
                         byte[] tokenBytes = dynamicToken.getBytes(StandardCharsets.UTF_8);
                         out.writeInt(tokenBytes.length);
                         out.write(tokenBytes);
+                    } else {
+                        log.warn("No dynamic token available for broadcast to %s for query %s", target, splitId);
                     }
                     
                     // 2. Control Magic
@@ -223,25 +231,32 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         }
     }
 
-    private java.sql.Connection getConnection() throws Exception {
-        java.sql.Driver driver = (java.sql.Driver) Class.forName("com.teradata.jdbc.TeraDriver")
-                .getDeclaredConstructor().newInstance();
-        java.util.Properties props = new java.util.Properties();
+    private Connection getConnection() throws SQLException {
+        try {
+            Class.forName("com.teradata.jdbc.TeraDriver");
+        } catch (ClassNotFoundException e) {
+            throw new SQLException("Teradata JDBC Driver not found", e);
+        }
+        
+        Properties props = new Properties();
         props.setProperty("user", config.getTeradataUser());
         props.setProperty("password", config.getTeradataPassword());
-        java.sql.Connection conn = driver.connect(config.getTeradataUrl(), props);
+        
+        Connection conn = DriverManager.getConnection(config.getTeradataUrl(), props);
         
         if (trinoUser != null && !trinoUser.isEmpty()) {
             String qb = "PROXYUSER=" + trinoUser + ";";
             try (java.sql.Statement stmt = conn.createStatement()) {
                 stmt.execute("SET QUERY_BAND = '" + qb + "' FOR SESSION;");
-            } catch (java.sql.SQLException e) {
+            } catch (SQLException e) {
                 if (config.isEnforceProxyAuthentication()) {
                     conn.close();
-                    throw new RuntimeException("Proxy authentication failed: " + e.getMessage(), e);
+                    throw new SQLException("Proxy authentication failed: " + e.getMessage(), e);
                 }
+                log.warn("Proxy authentication warning: %s", e.getMessage());
             }
         }
+        
         return conn;
     }
 

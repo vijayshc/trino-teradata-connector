@@ -26,12 +26,13 @@ public class TrinoExportPageSource implements ConnectorPageSource {
     private boolean finished = false;
 
     public TrinoExportPageSource(String queryId, List<ColumnHandle> columns, String teradataTimezone, 
-                                  long pagePollTimeoutMs, boolean enableDebugLogging) {
+                                  long pagePollTimeoutMs, boolean enableDebugLogging, int expectedConsumers) {
         this.queryId = queryId;
         
         // CRITICAL: Register buffer on THIS worker (multi-worker support)
         // Each worker needs its own buffer registration since DataBufferRegistry is per-JVM
-        DataBufferRegistry.registerQuery(queryId);
+        // Pass expectedConsumers to prevent premature cleanup with lazy splits
+        DataBufferRegistry.registerQuery(queryId, expectedConsumers);
         this.buffer = DataBufferRegistry.getBuffer(queryId);
         
         // Register this instance as a consumer to support parallel split processing
@@ -94,8 +95,7 @@ public class TrinoExportPageSource implements ConnectorPageSource {
             if (container.isEndOfStream()) {
                 log.debug("Received end of stream for query %s", queryId);
                 finished = true;
-                // Re-push the marker so other parallel consumers for the same query can also finish
-                DataBufferRegistry.pushEndMarker(queryId);
+                // NOTE: No need to re-push EOS - DataBufferRegistry now pushes EOS for each consumer
                 // Generate and log performance profile summary
                 PerformanceProfiler.generateSummary(queryId);
                 return null;

@@ -54,6 +54,11 @@ public class TrinoExportConfig {
     // === Logging Settings ===
     private boolean enableDebugLogging = false;
 
+    // === Scalability Settings ===
+    private int maxQueryConcurrency = 50;
+    private int maxBridgeThreads = 200;
+    private int bridgeQueueCapacity = 500;
+
     // ============================================================
     // Core Connection Getters/Setters
     // ============================================================
@@ -364,6 +369,40 @@ public class TrinoExportConfig {
     @Config("teradata.export.enable-debug-logging")
     public TrinoExportConfig setEnableDebugLogging(boolean enableDebugLogging) {
         this.enableDebugLogging = enableDebugLogging;
+        return this;
+    }
+
+    // ============================================================
+    // Scalability Getters/Setters
+    // ============================================================
+
+    public int getMaxQueryConcurrency() {
+        return maxQueryConcurrency;
+    }
+
+    @Config("teradata.export.max-query-concurrency")
+    public TrinoExportConfig setMaxQueryConcurrency(int maxQueryConcurrency) {
+        this.maxQueryConcurrency = maxQueryConcurrency;
+        return this;
+    }
+
+    public int getMaxBridgeThreads() {
+        return maxBridgeThreads;
+    }
+
+    @Config("teradata.export.max-bridge-threads")
+    public TrinoExportConfig setMaxBridgeThreads(int maxBridgeThreads) {
+        this.maxBridgeThreads = maxBridgeThreads;
+        return this;
+    }
+
+    public int getBridgeQueueCapacity() {
+        return bridgeQueueCapacity;
+    }
+
+    @Config("teradata.export.bridge-queue-capacity")
+    public TrinoExportConfig setBridgeQueueCapacity(int bridgeQueueCapacity) {
+        this.bridgeQueueCapacity = bridgeQueueCapacity;
         return this;
     }
 

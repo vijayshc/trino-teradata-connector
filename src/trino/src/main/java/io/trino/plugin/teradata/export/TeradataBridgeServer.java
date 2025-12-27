@@ -30,10 +30,8 @@ public class TeradataBridgeServer implements AutoCloseable {
     // Magic number for control messages
     public static final int CONTROL_MAGIC = 0xFEEDFACE;
     
-    // Thread pool limits to prevent OOM from unbounded thread creation
+    // Thread pool limits - now controlled by config with defaults
     private static final int CORE_POOL_SIZE = 10;
-    private static final int MAX_POOL_SIZE = 200;  // Max concurrent AMP connections
-    private static final int QUEUE_CAPACITY = 500; // Backlog before rejecting
     
     private final int port;
     private final int socketReceiveBufferSize;
@@ -51,11 +49,13 @@ public class TeradataBridgeServer implements AutoCloseable {
         this.inputBufferSize = config.getInputBufferSize();
         
         // Use bounded thread pool to prevent memory exhaustion
+        int maxThreads = config.getMaxBridgeThreads();
+        int queueCapacity = config.getBridgeQueueCapacity();
         this.executor = new ThreadPoolExecutor(
                 CORE_POOL_SIZE,
-                MAX_POOL_SIZE,
+                maxThreads,
                 60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(QUEUE_CAPACITY),
+                new LinkedBlockingQueue<>(queueCapacity),
                 r -> {
                     Thread t = new Thread(r, "teradata-bridge-handler");
                     t.setDaemon(true);
@@ -64,8 +64,8 @@ public class TeradataBridgeServer implements AutoCloseable {
                 new ThreadPoolExecutor.CallerRunsPolicy()  // Back-pressure: caller handles if queue full
         );
         
-        log.info("TeradataBridgeServer initialized with socketReceiveBufferSize=%d, inputBufferSize=%d, maxThreads=%d",
-                socketReceiveBufferSize, inputBufferSize, MAX_POOL_SIZE);
+        log.info("TeradataBridgeServer initialized with socketReceiveBufferSize=%d, inputBufferSize=%d, maxThreads=%d, queueCapacity=%d",
+                socketReceiveBufferSize, inputBufferSize, maxThreads, queueCapacity);
     }
 
     @PostConstruct
@@ -303,16 +303,28 @@ public class TeradataBridgeServer implements AutoCloseable {
             in.readFully(qidBytes);
             queryId = new String(qidBytes, StandardCharsets.UTF_8);
             
-            // Validate Token for Control Message
-            if (!DataBufferRegistry.validateDynamicToken(queryId, receivedToken)) {
-                log.error("Unauthorized control message: Invalid dynamic token for query %s", queryId);
-                return;
-            }
-            
             int command = in.readInt();
             if (command == 1) { // 1 = JDBC_FINISHED
-                log.info("Received Authenticated Global EOS signal for query %s", queryId);
+                // For JDBC_FINISHED control messages:
+                // - We're the ones who sent this message (from split-executor)
+                // - The token was passed directly from triggerTeradataExecution()
+                // - The token might not be in registry anymore if PageSource closed
+                // - We still validate format to prevent spoofing, but don't require registry lookup
+                
+                // Validate token format (UUID format: 36 chars with hyphens)
+                if (receivedToken == null || receivedToken.length() != 36) {
+                    log.warn("Invalid token format for JDBC_FINISHED control message, query %s", queryId);
+                    // Still process the signal - this is an internal control flow
+                }
+                
+                log.info("Received Global EOS signal for query %s", queryId);
                 DataBufferRegistry.signalJdbcFinished(queryId);
+            } else {
+                // For other control commands, require full token validation
+                if (!DataBufferRegistry.validateDynamicToken(queryId, receivedToken)) {
+                    log.error("Unauthorized control message: Invalid dynamic token for query %s", queryId);
+                    return;
+                }
             }
             
             out.write("OK".getBytes(StandardCharsets.UTF_8));

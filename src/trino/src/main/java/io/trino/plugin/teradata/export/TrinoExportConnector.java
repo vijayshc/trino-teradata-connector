@@ -53,7 +53,8 @@ public class TrinoExportConnector implements Connector {
                     columns, 
                     config.getTeradataTimezone(),
                     config.getPagePollTimeoutMs(),
-                    config.isEnableDebugLogging());
+                    config.isEnableDebugLogging(),
+                    config.getSplitsPerWorker());
         };
     }
 

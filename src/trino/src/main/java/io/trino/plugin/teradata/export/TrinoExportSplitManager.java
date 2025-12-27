@@ -27,10 +27,9 @@ import java.util.concurrent.ThreadPoolExecutor;
 public class TrinoExportSplitManager implements ConnectorSplitManager {
     private static final Logger log = Logger.get(TrinoExportSplitManager.class);
     
-    // Thread pool limits for Teradata execution threads
+    // Thread pool limits for Teradata execution threads - now uses config with defaults
     private static final int CORE_POOL_SIZE = 5;
-    private static final int MAX_POOL_SIZE = 50;  // Max concurrent Teradata queries
-    private static final int QUEUE_CAPACITY = 100; // Backlog before rejecting
+    private static final int DEFAULT_QUEUE_CAPACITY = 100; // Backlog before rejecting
     
     private final NodeManager nodeManager;
     private final TrinoExportConfig config;
@@ -40,13 +39,15 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
     public TrinoExportSplitManager(NodeManager nodeManager, TrinoExportConfig config) {
         this.nodeManager = nodeManager;
         this.config = config;
+        // connectionPool removed
         
         // Use bounded thread pool to prevent memory exhaustion from unbounded threads
+        int maxThreads = config.getMaxQueryConcurrency();
         this.executor = new ThreadPoolExecutor(
                 CORE_POOL_SIZE,
-                MAX_POOL_SIZE,
+                maxThreads,
                 60L, java.util.concurrent.TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(QUEUE_CAPACITY),
+                new LinkedBlockingQueue<>(DEFAULT_QUEUE_CAPACITY),
                 r -> {
                     Thread t = new Thread(r, "teradata-split-executor");
                     t.setDaemon(true);
@@ -55,7 +56,7 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
                 new ThreadPoolExecutor.CallerRunsPolicy()  // Back-pressure
         );
         
-        log.info("TrinoExportSplitManager initialized with maxThreads=%d", MAX_POOL_SIZE);
+        log.info("TrinoExportSplitManager initialized with maxThreads=%d, connection pool ready", maxThreads);
     }
 
     @PreDestroy

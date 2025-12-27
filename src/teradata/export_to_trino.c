@@ -156,11 +156,12 @@ static int write_unicode_to_utf8(unsigned char *buf, const unsigned char *val, i
 }
 
 static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *param_stream) {
-    char target_ips[2048] = "";
+    char *target_ips = (char *)FNC_malloc(32768);
+    if (target_ips) target_ips[0] = '\0';
     params->query_id[0] = '\0';
     params->batch_size = BATCH_SIZE;
 
-    if (param_stream && FNC_TblOpRead(param_stream) == TBLOP_SUCCESS) {
+    if (param_stream && FNC_TblOpRead(param_stream) == TBLOP_SUCCESS && target_ips) {
         int c;
         for (c = 0; c < 5; c++) {
             if (c >= FNC_TblOpGetColCount(1, ISINPUT)) break;
@@ -243,10 +244,10 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
      * Each AMP vproc runs as a separate process with unique PID.
      * FNC_TblOpGetUniqID may return same value for all AMPs. */
     INTEGER amp_id = (INTEGER)getpid();
-    char *ips[128]; int ip_count = 0;
+    char *ips[1024]; int ip_count = 0;
     char *saveptr;
     char *token = strtok_r(target_ips, ",", &saveptr);
-    while (token && ip_count < 128) {
+    while (token && ip_count < 1024) {
         while (*token == ' ') token++; /* skip leading spaces */
         ips[ip_count++] = token;
         token = strtok_r(NULL, ",", &saveptr);
@@ -264,6 +265,7 @@ static void parse_params_from_stream(ExportParams_t *params, FNC_TblOpHandle_t *
     } else {
         strcpy(params->bridge_host, "172.27.251.157"); params->bridge_port = 9999;
     }
+    if (target_ips) FNC_free(target_ips);
 }
 
 static int write_hex_string(unsigned char *buf, void *value, int bytesize) {

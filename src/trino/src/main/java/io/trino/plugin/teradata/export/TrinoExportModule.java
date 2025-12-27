@@ -14,5 +14,6 @@ public class TrinoExportModule implements Module {
         binder.bind(TrinoExportMetadata.class).in(Scopes.SINGLETON);
         binder.bind(TrinoExportFlightServer.class).in(Scopes.SINGLETON);
         binder.bind(TeradataBridgeServer.class).in(Scopes.SINGLETON);
+
     }
 }
