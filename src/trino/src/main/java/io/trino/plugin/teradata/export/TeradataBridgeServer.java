@@ -127,7 +127,11 @@ public class TeradataBridgeServer implements AutoCloseable {
                 return;
             }
             
-            // It's a normal Query ID
+            // It's a normal Query ID - Validate length to prevent NegativeArraySizeException
+            if (lenOrMagic <= 0 || lenOrMagic > 1024) {
+                log.error("Invalid Query ID length or Magic Number: %d from %s", lenOrMagic, socket.getRemoteSocketAddress());
+                return;
+            }
             byte[] queryIdBytes = new byte[lenOrMagic];
             in.readFully(queryIdBytes);
             queryId = new String(queryIdBytes, StandardCharsets.UTF_8);

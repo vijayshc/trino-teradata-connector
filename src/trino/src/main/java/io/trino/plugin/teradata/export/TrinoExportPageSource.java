@@ -26,13 +26,19 @@ public class TrinoExportPageSource implements ConnectorPageSource {
     private boolean finished = false;
 
     public TrinoExportPageSource(String queryId, List<ColumnHandle> columns, String teradataTimezone, 
-                                  long pagePollTimeoutMs, boolean enableDebugLogging, int expectedConsumers) {
+                                  long pagePollTimeoutMs, boolean enableDebugLogging, int expectedConsumers, String token) {
         this.queryId = queryId;
         
         // CRITICAL: Register buffer on THIS worker (multi-worker support)
         // Each worker needs its own buffer registration since DataBufferRegistry is per-JVM
         // Pass expectedConsumers to prevent premature cleanup with lazy splits
         DataBufferRegistry.registerQuery(queryId, expectedConsumers);
+        
+        // Register the security token on THIS worker
+        if (token != null) {
+            DataBufferRegistry.registerDynamicToken(queryId, token);
+        }
+        
         this.buffer = DataBufferRegistry.getBuffer(queryId);
         
         // Register this instance as a consumer to support parallel split processing

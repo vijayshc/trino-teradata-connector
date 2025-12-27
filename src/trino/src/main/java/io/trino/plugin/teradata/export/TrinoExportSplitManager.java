@@ -91,8 +91,13 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         String randomSuffix = Long.toHexString(System.nanoTime() & 0xFFFFF);
         String splitId = baseQueryId + "_" + tableHash + "_" + randomSuffix;
         
-        // Note: Don't register query here for multi-worker - let each worker's PageSource register
-        // DataBufferRegistry.registerQuery(splitId); 
+        // SECURITY: Generate a random, per-query token to replace the static token in query logs.
+        // Generate it here so it can be distributed to all workers via Splits.
+        String dynamicToken = java.util.UUID.randomUUID().toString();
+        log.info("Generated dynamic token for query %s", splitId);
+        
+        // Register token on coordinator node immediately (for the JDBC execution thread)
+        DataBufferRegistry.registerDynamicToken(splitId, dynamicToken);
 
         // Build worker IPs for Teradata to connect to
         // For multi-worker clusters: resolve hostnames to IPs for Teradata's inet_pton()
@@ -106,14 +111,14 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
         int splitsPerWorker = config.getSplitsPerWorker();
         for (Node node : workers) {
             for (int i = 0; i < splitsPerWorker; i++) {
-                splits.add(new TrinoExportSplit(node.getHost(), splitId, allWorkerIps));
+                splits.add(new TrinoExportSplit(node.getHost(), splitId, allWorkerIps, dynamicToken));
             }
         }
 
         // Use custom SplitSource that waits for dynamic filter completion
         // This is critical for proper dynamic filter pushdown to Teradata
         return new TrinoExportDynamicFilteringSplitSource(
-                splits, dynamicFilter, tableHandle, splitId, allWorkerIps, session.getUser(), config, executor);
+                splits, dynamicFilter, tableHandle, splitId, allWorkerIps, dynamicToken, session.getUser(), config, executor);
     }
     
     /**

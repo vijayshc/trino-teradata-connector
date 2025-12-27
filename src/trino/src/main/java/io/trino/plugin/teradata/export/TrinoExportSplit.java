@@ -20,15 +20,18 @@ public class TrinoExportSplit implements ConnectorSplit {
     private final String workerHost;
     private final String queryId;
     private final String targetIps;
+    private final String token;
 
     @JsonCreator
     public TrinoExportSplit(
             @JsonProperty("workerHost") String workerHost,
             @JsonProperty("queryId") String queryId,
-            @JsonProperty("targetIps") String targetIps) {
+            @JsonProperty("targetIps") String targetIps,
+            @JsonProperty("token") String token) {
         this.workerHost = workerHost;
         this.queryId = queryId;
         this.targetIps = targetIps;
+        this.token = token;
     }
 
     @JsonProperty
@@ -44,6 +47,11 @@ public class TrinoExportSplit implements ConnectorSplit {
     @JsonProperty
     public String getTargetIps() {
         return targetIps;
+    }
+
+    @JsonProperty
+    public String getToken() {
+        return token;
     }
 
     /**
@@ -68,7 +76,8 @@ public class TrinoExportSplit implements ConnectorSplit {
         return Map.of(
             "workerHost", workerHost,
             "queryId", queryId,
-            "targetIps", targetIps
+            "targetIps", targetIps,
+            "token", token
         );
     }
 }

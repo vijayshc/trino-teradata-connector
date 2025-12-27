@@ -30,6 +30,7 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
     private final TrinoExportTableHandle tableHandle;
     private final String splitId;
     private final String targetIps;
+    private final String dynamicToken;
     private final String trinoUser;
     private final TrinoExportConfig config;
     private final ExecutorService executor;
@@ -45,6 +46,7 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
             TrinoExportTableHandle tableHandle,
             String splitId,
             String targetIps,
+            String dynamicToken,
             String trinoUser,
             TrinoExportConfig config,
             ExecutorService executor) {
@@ -53,6 +55,7 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         this.tableHandle = tableHandle;
         this.splitId = splitId;
         this.targetIps = targetIps;
+        this.dynamicToken = dynamicToken;
         this.trinoUser = trinoUser;
         this.config = config;
         this.executor = executor;
@@ -147,9 +150,8 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         String innerQuery = "SELECT" + topClause + " " + columnList + " FROM " + schemaTable + 
                            whereClause + groupByClause + orderByClause + sampleClause;
         
-        // SECURITY: Generate a random, per-query token to replace the static token in query logs.
-        String dynamicToken = UUID.randomUUID().toString();
-        DataBufferRegistry.registerDynamicToken(splitId, dynamicToken);
+        // SECURITY: Dynamic token is now passed from SplitManager to ensure consistency across cluster
+        // DataBufferRegistry.registerDynamicToken(splitId, dynamicToken); // Already registered by SplitManager
         
         String compressionAlgorithmName = "NONE";
         if (config.isCompressionEnabled()) {

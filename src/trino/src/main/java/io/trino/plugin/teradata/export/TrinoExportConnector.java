@@ -54,7 +54,8 @@ public class TrinoExportConnector implements Connector {
                     config.getTeradataTimezone(),
                     config.getPagePollTimeoutMs(),
                     config.isEnableDebugLogging(),
-                    config.getSplitsPerWorker());
+                    config.getSplitsPerWorker(),
+                    exportSplit.getToken());
         };
     }
 
