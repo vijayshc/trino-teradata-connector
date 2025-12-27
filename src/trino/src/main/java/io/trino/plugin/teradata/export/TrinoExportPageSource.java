@@ -55,7 +55,7 @@ public class TrinoExportPageSource implements ConnectorPageSource {
         // Get local timezone offset
         this.localZoneOffset = java.time.ZoneId.systemDefault().getRules().getOffset(java.time.Instant.now());
         
-        log.info("PageSource created for query %s. Registered %d column types.", queryId, types.size());
+        log.debug("PageSource created for query %s. Registered %d column types.", queryId, types.size());
     }
 
     @Override
@@ -92,7 +92,7 @@ public class TrinoExportPageSource implements ConnectorPageSource {
             }
 
             if (container.isEndOfStream()) {
-                log.info("Received end of stream for query %s", queryId);
+                log.debug("Received end of stream for query %s", queryId);
                 finished = true;
                 // Re-push the marker so other parallel consumers for the same query can also finish
                 DataBufferRegistry.pushEndMarker(queryId);
@@ -126,6 +126,12 @@ public class TrinoExportPageSource implements ConnectorPageSource {
     @Override
     public void close() throws IOException {
         finished = true;
-        DataBufferRegistry.deregisterQuery(queryId);
+        // CRITICAL: Guaranteed cleanup - must succeed even if partial failure
+        try {
+            DataBufferRegistry.deregisterQuery(queryId);
+        } catch (Exception e) {
+            // Log but don't throw - cleanup must complete
+            log.warn("Error during cleanup for query %s: %s", queryId, e.getMessage());
+        }
     }
 }

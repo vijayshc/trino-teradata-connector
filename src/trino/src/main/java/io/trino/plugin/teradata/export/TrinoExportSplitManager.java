@@ -21,16 +21,41 @@ import java.util.Properties;
 
 import javax.annotation.PreDestroy;
 
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+
 public class TrinoExportSplitManager implements ConnectorSplitManager {
     private static final Logger log = Logger.get(TrinoExportSplitManager.class);
+    
+    // Thread pool limits for Teradata execution threads
+    private static final int CORE_POOL_SIZE = 5;
+    private static final int MAX_POOL_SIZE = 50;  // Max concurrent Teradata queries
+    private static final int QUEUE_CAPACITY = 100; // Backlog before rejecting
+    
     private final NodeManager nodeManager;
     private final TrinoExportConfig config;
-    private final ExecutorService executor = Executors.newCachedThreadPool();
+    private final ExecutorService executor;
 
     @Inject
     public TrinoExportSplitManager(NodeManager nodeManager, TrinoExportConfig config) {
         this.nodeManager = nodeManager;
         this.config = config;
+        
+        // Use bounded thread pool to prevent memory exhaustion from unbounded threads
+        this.executor = new ThreadPoolExecutor(
+                CORE_POOL_SIZE,
+                MAX_POOL_SIZE,
+                60L, java.util.concurrent.TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(QUEUE_CAPACITY),
+                r -> {
+                    Thread t = new Thread(r, "teradata-split-executor");
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy()  // Back-pressure
+        );
+        
+        log.info("TrinoExportSplitManager initialized with maxThreads=%d", MAX_POOL_SIZE);
     }
 
     @PreDestroy
@@ -225,7 +250,9 @@ public class TrinoExportSplitManager implements ConnectorSplitManager {
             ") AS export_result", columnList, tableName, whereClause, sampleClause, 
             targetIps, queryId, config.getSecurityToken() != null ? config.getSecurityToken() : "", config.getBatchSize(), config.isCompressionEnabled() ? 1 : 0);
 
-        log.info("Executing Teradata SQL for query %s: %s", queryId, sql);
+        // SECURITY: Mask the security token in logged SQL
+        String logSql = sql.replace(config.getSecurityToken() != null ? config.getSecurityToken() : "", "***MASKED***");
+        log.info("Executing Teradata SQL for query %s: %s", queryId, logSql);
 
         try {
             // Explicitly load driver to ensure it's available in this context

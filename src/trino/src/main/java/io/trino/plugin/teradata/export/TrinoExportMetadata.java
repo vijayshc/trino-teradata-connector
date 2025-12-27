@@ -1,21 +1,39 @@
 package io.trino.plugin.teradata.export;
 
 import io.airlift.log.Logger;
+import io.trino.spi.TrinoException;
+import io.trino.spi.StandardErrorCode;
 import javax.inject.Inject;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 
 public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMetadata {
     private static final Logger log = Logger.get(TrinoExportMetadata.class);
     private final TrinoExportConfig config;
-    private final Map<io.trino.spi.connector.SchemaTableName, List<io.trino.spi.connector.ColumnMetadata>> tableCache = new ConcurrentHashMap<>();
+    
+    // Bounded LRU table cache - max 1000 tables to prevent unbounded memory growth
+    // Uses synchronized wrapper for thread safety
+    private static final int MAX_CACHE_SIZE = 1000;
+    private final Map<io.trino.spi.connector.SchemaTableName, List<io.trino.spi.connector.ColumnMetadata>> tableCache = 
+            Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry eldest) {
+                    boolean shouldRemove = size() > MAX_CACHE_SIZE;
+                    if (shouldRemove) {
+                        log.debug("Evicting oldest cache entry, cache size: %d", size());
+                    }
+                    return shouldRemove;
+                }
+            });
 
     @Inject
     public TrinoExportMetadata(TrinoExportConfig config) {
@@ -36,8 +54,14 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
                     }
                 }
             }
+        } catch (SQLException e) {
+            log.error(e, "Teradata error listing schema names");
+            throw new TrinoException(StandardErrorCode.GENERIC_USER_ERROR, 
+                    "Teradata error: " + e.getMessage(), e);
         } catch (Exception e) {
             log.error(e, "Error listing schema names from Teradata");
+            throw new TrinoException(StandardErrorCode.GENERIC_INTERNAL_ERROR, 
+                    "Failed to list schemas: " + e.getMessage(), e);
         }
         
         // Add configurable default schemas
@@ -58,6 +82,17 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
             Optional<io.trino.spi.connector.ConnectorTableVersion> startVersion,
             Optional<io.trino.spi.connector.ConnectorTableVersion> endVersion) {
         log.info("getTableHandle: %s", tableName);
+        
+        // Validate that the table actually exists in Teradata before returning a handle
+        // This prevents queries from proceeding to data transfer stage if table doesn't exist
+        List<io.trino.spi.connector.ColumnMetadata> columns = getColumnMetadataList(session, tableName);
+        if (columns == null || columns.isEmpty()) {
+            log.warn("Table %s does not exist in Teradata or has no columns", tableName);
+            // Return null to let Trino report standard "Table does not exist" error
+            // This is the Trino convention for non-existent tables
+            return null;
+        }
+        
         return new TrinoExportTableHandle(tableName);
     }
 
@@ -71,29 +106,44 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
     }
 
     private List<io.trino.spi.connector.ColumnMetadata> getColumnMetadataList(io.trino.spi.connector.ConnectorSession session, io.trino.spi.connector.SchemaTableName tableName) {
-        return tableCache.computeIfAbsent(tableName, name -> {
-            log.info("Fetching columns for %s (Schema: %s, Table: %s)", name, name.getSchemaName(), name.getTableName());
-            List<io.trino.spi.connector.ColumnMetadata> columns = new ArrayList<>();
+        // Check bounded LRU cache first
+        List<io.trino.spi.connector.ColumnMetadata> cached = tableCache.get(tableName);
+        if (cached != null) {
+            return cached;
+        }
+        
+        log.info("Fetching columns for %s (Schema: %s, Table: %s)", tableName, tableName.getSchemaName(), tableName.getTableName());
+        List<io.trino.spi.connector.ColumnMetadata> columns = new ArrayList<>();
+        
+        try (Connection conn = getConnection(null)) {
+            // Try as provided
+            fetchColumns(conn, tableName.getSchemaName(), tableName.getTableName(), columns);
             
-            try (Connection conn = getConnection(null)) {
-                // Try as provided
-                fetchColumns(conn, name.getSchemaName(), name.getTableName(), columns);
-                
-                // Try upper case
-                if (columns.isEmpty()) {
-                     fetchColumns(conn, name.getSchemaName(), name.getTableName().toUpperCase(), columns);
-                }
-                 // Try upper case schema
-                if (columns.isEmpty()) {
-                     fetchColumns(conn, name.getSchemaName().toUpperCase(), name.getTableName().toUpperCase(), columns);
-                }
-
-                log.info("Found %d columns for %s", columns.size(), name);
-            } catch (Exception e) {
-                log.error(e, "Error fetching columns for %s", name);
+            // Try upper case table name
+            if (columns.isEmpty()) {
+                 fetchColumns(conn, tableName.getSchemaName(), tableName.getTableName().toUpperCase(), columns);
             }
+            // Try upper case schema and table
+            if (columns.isEmpty()) {
+                 fetchColumns(conn, tableName.getSchemaName().toUpperCase(), tableName.getTableName().toUpperCase(), columns);
+            }
+
+            log.info("Found %d columns for %s", columns.size(), tableName);
+            
+            // Cache the result (LRU eviction handles memory bounds)
+            tableCache.put(tableName, columns);
             return columns;
-        });
+            
+        } catch (SQLException e) {
+            // Propagate Teradata JDBC errors to Trino so user sees actual error message
+            log.error(e, "Teradata error fetching columns for %s", tableName);
+            throw new TrinoException(StandardErrorCode.GENERIC_USER_ERROR, 
+                    "Teradata error: " + e.getMessage(), e);
+        } catch (Exception e) {
+            log.error(e, "Error fetching columns for %s", tableName);
+            throw new TrinoException(StandardErrorCode.GENERIC_INTERNAL_ERROR, 
+                    "Failed to fetch table metadata: " + e.getMessage(), e);
+        }
     }
 
 
@@ -123,8 +173,14 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
                     tables.add(new io.trino.spi.connector.SchemaTableName(realSchema != null ? realSchema : schema, rs.getString("TABLE_NAME")));
                 }
             }
+        } catch (SQLException e) {
+            log.error(e, "Teradata error listing tables for schema %s", schema);
+            throw new TrinoException(StandardErrorCode.GENERIC_USER_ERROR, 
+                    "Teradata error: " + e.getMessage(), e);
         } catch (Exception e) {
             log.error(e, "Error listing tables for schema %s", schema);
+            throw new TrinoException(StandardErrorCode.GENERIC_INTERNAL_ERROR, 
+                    "Failed to list tables: " + e.getMessage(), e);
         }
         log.info("Found %d tables for schema %s", tables.size(), schema);
         return tables;
@@ -133,7 +189,7 @@ public class TrinoExportMetadata implements io.trino.spi.connector.ConnectorMeta
     @Override
     public Map<String, io.trino.spi.connector.ColumnHandle> getColumnHandles(io.trino.spi.connector.ConnectorSession session, io.trino.spi.connector.ConnectorTableHandle tableHandle) {
         TrinoExportTableHandle handle = (TrinoExportTableHandle) tableHandle;
-        Map<String, io.trino.spi.connector.ColumnHandle> columnHandles = new ConcurrentHashMap<>();
+        Map<String, io.trino.spi.connector.ColumnHandle> columnHandles = new java.util.HashMap<>();
         java.util.List<io.trino.spi.connector.ColumnMetadata> columns = getColumnMetadataList(session, handle.getSchemaTableName());
         for (int i = 0; i < columns.size(); i++) {
             io.trino.spi.connector.ColumnMetadata column = columns.get(i);

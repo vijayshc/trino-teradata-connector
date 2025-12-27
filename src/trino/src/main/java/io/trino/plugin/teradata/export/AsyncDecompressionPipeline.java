@@ -41,9 +41,8 @@ public final class AsyncDecompressionPipeline {
     private volatile boolean finished = false;
     private volatile Throwable error = null;
 
-    // Inflater per thread (thread-local for thread safety)
-    private static final ThreadLocal<Inflater> inflaters = 
-            ThreadLocal.withInitial(Inflater::new);
+    // Note: Each worker creates its own Inflater instance for thread safety and cleanup guarantee
+    // No ThreadLocal pattern - ensures cleanup even on thread interruption
             
     private final CountDownLatch workerLatch;
 
@@ -113,8 +112,12 @@ public final class AsyncDecompressionPipeline {
 
     private void decompressAndParseWorker() {
         byte[] decompressionBuffer = new byte[64 * 1024 * 1024];
+        Inflater inflater = null;  // Per-worker instance, not ThreadLocal
         
         try {
+            // Create own Inflater instance for this worker
+            inflater = compressionEnabled ? new Inflater() : null;
+            
             while (!finished) {
                 CompressedBatch batch = compressedQueue.poll(100, TimeUnit.MILLISECONDS);
                 if (batch == null) continue;
@@ -130,7 +133,6 @@ public final class AsyncDecompressionPipeline {
                 int decompressedLen;
 
                 if (compressionEnabled) {
-                    Inflater inflater = inflaters.get();
                     inflater.reset();
                     inflater.setInput(batch.data, 0, batch.length);
                     decompressedLen = inflater.inflate(decompressionBuffer);
@@ -155,10 +157,21 @@ public final class AsyncDecompressionPipeline {
                     }
                 }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.debug("Decompression worker interrupted for query %s", queryId);
         } catch (Exception e) {
             error = e;
             log.error(e, "Error in async decompression worker for query %s", queryId);
         } finally {
+            // CRITICAL: Clean up Inflater native resources - guaranteed even on interrupt
+            if (inflater != null) {
+                try {
+                    inflater.end();
+                } catch (Exception e) {
+                    log.warn("Error ending Inflater in worker: %s", e.getMessage());
+                }
+            }
             workerLatch.countDown();
         }
     }
@@ -166,6 +179,10 @@ public final class AsyncDecompressionPipeline {
     public void shutdown() {
         finished = true;
         decompressionPool.shutdownNow();
+        // CRITICAL: Release DirectByteBuffer native memory
+        if (bufferPool != null) {
+            bufferPool.close();
+        }
     }
     
     public void awaitCompletion() throws InterruptedException {

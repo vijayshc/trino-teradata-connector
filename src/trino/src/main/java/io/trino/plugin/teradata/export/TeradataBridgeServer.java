@@ -12,7 +12,8 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -29,6 +30,11 @@ public class TeradataBridgeServer implements AutoCloseable {
     // Magic number for control messages
     public static final int CONTROL_MAGIC = 0xFEEDFACE;
     
+    // Thread pool limits to prevent OOM from unbounded thread creation
+    private static final int CORE_POOL_SIZE = 10;
+    private static final int MAX_POOL_SIZE = 200;  // Max concurrent AMP connections
+    private static final int QUEUE_CAPACITY = 500; // Backlog before rejecting
+    
     private final int port;
     private final int socketReceiveBufferSize;
     private final int inputBufferSize;
@@ -43,14 +49,23 @@ public class TeradataBridgeServer implements AutoCloseable {
         this.port = config.getBridgePort();
         this.socketReceiveBufferSize = config.getSocketReceiveBufferSize();
         this.inputBufferSize = config.getInputBufferSize();
-        this.executor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "teradata-bridge-handler");
-            t.setDaemon(true);
-            return t;
-        });
         
-        log.info("TeradataBridgeServer initialized with socketReceiveBufferSize=%d, inputBufferSize=%d",
-                socketReceiveBufferSize, inputBufferSize);
+        // Use bounded thread pool to prevent memory exhaustion
+        this.executor = new ThreadPoolExecutor(
+                CORE_POOL_SIZE,
+                MAX_POOL_SIZE,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(QUEUE_CAPACITY),
+                r -> {
+                    Thread t = new Thread(r, "teradata-bridge-handler");
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy()  // Back-pressure: caller handles if queue full
+        );
+        
+        log.info("TeradataBridgeServer initialized with socketReceiveBufferSize=%d, inputBufferSize=%d, maxThreads=%d",
+                socketReceiveBufferSize, inputBufferSize, MAX_POOL_SIZE);
     }
 
     @PostConstruct
@@ -88,7 +103,8 @@ public class TeradataBridgeServer implements AutoCloseable {
         long compressedBytes = 0;
         long decompressedBytes = 0;
         int totalRows = 0;
-        
+        java.util.zip.Inflater inflater = null;  // Declare outside try for proper cleanup
+            
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), inputBufferSize));
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             
@@ -154,9 +170,10 @@ public class TeradataBridgeServer implements AutoCloseable {
             // Initialize profiler
             PerformanceProfiler.getOrCreate(queryId);
             
-            // Synchronous processing - create decompression buffer if needed
-            java.util.zip.Inflater inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
-            byte[] decompressionBuffer = compressionEnabled ? new byte[64 * 1024 * 1024] : null;
+            // Synchronous processing - create decompression buffer with dynamic sizing
+            // Start with 4MB and grow if needed (reduces GC pressure vs fixed 64MB)
+            inflater = compressionEnabled ? new java.util.zip.Inflater() : null;
+            byte[] decompressionBuffer = compressionEnabled ? new byte[4 * 1024 * 1024] : null;
 
             // Read and process batches synchronously until end of stream
             while (true) {
@@ -182,6 +199,19 @@ public class TeradataBridgeServer implements AutoCloseable {
                     long decompStart = System.nanoTime();
                     inflater.reset();
                     inflater.setInput(batchData, 0, batchLen);
+                    
+                    // Dynamic buffer growth: if buffer too small, allocate larger one
+                    // Estimate decompressed size (typical ratio 3-10x)
+                    int estimatedSize = batchLen * 10;
+                    if (estimatedSize > decompressionBuffer.length) {
+                        // Cap at 64MB to prevent OOM from malicious/corrupt data
+                        int newSize = Math.min(estimatedSize, 64 * 1024 * 1024);
+                        if (newSize > decompressionBuffer.length) {
+                            log.debug("Growing decompression buffer from %d to %d bytes", decompressionBuffer.length, newSize);
+                            decompressionBuffer = new byte[newSize];
+                        }
+                    }
+                    
                     decompressedLen = inflater.inflate(decompressionBuffer);
                     long decompEnd = System.nanoTime();
                     PerformanceProfiler.recordDecompression(queryId, decompEnd - decompStart, decompressedLen);
@@ -222,6 +252,15 @@ public class TeradataBridgeServer implements AutoCloseable {
         } catch (Exception e) {
             log.error(e, "Error handling client for query %s", queryId);
         } finally {
+            // CRITICAL: Release Inflater native memory to prevent native memory leak
+            if (inflater != null) {
+                try {
+                    inflater.end();
+                } catch (Exception e) {
+                    log.warn("Error ending Inflater for query %s: %s", queryId, e.getMessage());
+                }
+            }
+            
             // CRITICAL: Connection is only decremented AFTER all data is in the buffer
             if (incremented) {
                 DataBufferRegistry.decrementConnections(queryId);

@@ -17,6 +17,10 @@ import io.airlift.log.Logger;
  * Global registry for buffering Arrow batches received from Teradata.
  * Each query has its own isolated buffer identified by QueryID.
  * 
+ * MEMORY MANAGEMENT: All cleanup is deterministic and integrated into query lifecycle:
+ * - deregisterQuery(): Called when PageSource closes (normal completion)
+ * - cleanupOnFailure(): Called when JDBC execution fails (error path)
+ * 
  * IMPORTANT: This registry is static but per-JVM. In a multi-worker Trino cluster,
  * each worker has its own isolated instance. The design ensures:
  * 1. Each worker registers its own buffer when PageSource is created
@@ -27,7 +31,9 @@ public class DataBufferRegistry {
     private static final Logger log = Logger.get(DataBufferRegistry.class);
     private static final Map<String, QueryBuffer> queryBuffers = new ConcurrentHashMap<>();
     private static final Map<String, List<Type>> schemaRegistry = new ConcurrentHashMap<>();
-    private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+    
+    // Scheduler for short-lived EOS timing checks only (ms-scale delays, not TTL cleanup)
+    private static final ScheduledExecutorService eosScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "data-buffer-eos-scheduler");
         t.setDaemon(true);
         return t;
@@ -35,6 +41,8 @@ public class DataBufferRegistry {
     
     // Configurable queue capacity (set from TrinoExportConfig during initialization)
     private static int bufferQueueCapacity = 100;  // Default value
+    
+    // NOTE: No TTL-based cleanup - all cleanup is deterministic via deregisterQuery/cleanupOnFailure
 
     private static class QueryBuffer {
         final BlockingQueue<BatchContainer> queue;
@@ -45,6 +53,10 @@ public class DataBufferRegistry {
         final long createdAt = System.currentTimeMillis();
         volatile long lastActivityTime = System.currentTimeMillis();
         final AtomicInteger activeConsumers = new AtomicInteger(0);
+        
+        // Error signaling for immediate failure propagation
+        volatile Exception queryError = null;
+        volatile String errorMessage = null;
 
         QueryBuffer(int capacity) {
             this.queue = new LinkedBlockingQueue<>(capacity);
@@ -76,14 +88,14 @@ public class DataBufferRegistry {
                 
                 if (idleTime < 100) {
                     log.debug("EOS check deferred for query %s (stabilizing: %d ms)", queryId, idleTime);
-                    scheduler.schedule(() -> checkAndSignalEos(queryId), 100, TimeUnit.MILLISECONDS);
+                    eosScheduler.schedule(() -> checkAndSignalEos(queryId), 100, TimeUnit.MILLISECONDS);
                     return;
                 }
 
                 try {
                     queue.put(BatchContainer.endOfStream());
                     eosSignaled = true;
-                    log.info("Signaled end of stream for query %s (connections completed, data in buffer)", queryId);
+                    log.debug("Signaled end of stream for query %s (connections completed, data in buffer)", queryId);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -96,7 +108,7 @@ public class DataBufferRegistry {
                 // Wait up to 5 seconds for connections, then give up
                 if (timeSinceCreation < 5000) {
                     log.debug("EOS check deferred for query %s (waiting for connections, age: %d ms)", queryId, timeSinceCreation);
-                    scheduler.schedule(() -> checkAndSignalEos(queryId), 500, TimeUnit.MILLISECONDS);
+                    eosScheduler.schedule(() -> checkAndSignalEos(queryId), 500, TimeUnit.MILLISECONDS);
                     return;
                 }
                 
@@ -104,7 +116,7 @@ public class DataBufferRegistry {
                 try {
                     queue.put(BatchContainer.endOfStream());
                     eosSignaled = true;
-                    log.info("Signaled end of stream for query %s (no connections received, assuming empty result)", queryId);
+                    log.debug("Signaled end of stream for query %s (no connections received, assuming empty result)", queryId);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -119,7 +131,7 @@ public class DataBufferRegistry {
                 try {
                     queue.put(BatchContainer.endOfStream());
                     eosSignaled = true;
-                    log.info("Force signaled end of stream for query %s", queryId);
+                    log.debug("Force signaled end of stream for query %s", queryId);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -129,7 +141,7 @@ public class DataBufferRegistry {
 
     public static void setBufferQueueCapacity(int capacity) {
         bufferQueueCapacity = capacity;
-        log.info("DataBufferRegistry queue capacity set to %d", capacity);
+        log.debug("DataBufferRegistry queue capacity set to %d", capacity);
     }
 
     public static int getBufferQueueCapacity() {
@@ -138,7 +150,7 @@ public class DataBufferRegistry {
 
     public static void registerQuery(String queryId) {
         queryBuffers.computeIfAbsent(queryId, k -> {
-            log.info("Registered buffer for query %s (capacity: %d)", queryId, bufferQueueCapacity);
+            log.debug("Registered buffer for query %s (capacity: %d)", queryId, bufferQueueCapacity);
             return new QueryBuffer(bufferQueueCapacity);
         });
     }
@@ -160,7 +172,11 @@ public class DataBufferRegistry {
             }
             
             queryBuffers.remove(queryId);
-            log.info("Deregistering and clearing buffer for query %s. All consumers closed.", queryId);
+            // Also clean up schema registry and performance profiler entries
+            schemaRegistry.remove(queryId);
+            PerformanceProfiler.clear(queryId);
+            
+            log.debug("Deregistered buffer, schema, and profiler for query %s. All consumers closed.", queryId);
             while (!buffer.queue.isEmpty()) {
                 BatchContainer container = buffer.queue.poll();
                 if (container != null && !container.isEndOfStream()) {
@@ -175,6 +191,8 @@ public class DataBufferRegistry {
             }
         }
     }
+    
+    // NOTE: cleanupStaleBuffers removed - all cleanup is deterministic via deregisterQuery/cleanupOnFailure
 
     public static BlockingQueue<BatchContainer> getBuffer(String queryId) {
         QueryBuffer buffer = queryBuffers.get(queryId);
@@ -213,10 +231,48 @@ public class DataBufferRegistry {
     public static void signalJdbcFinished(String queryId) {
         QueryBuffer buffer = queryBuffers.get(queryId);
         if (buffer != null) {
-            log.info("JDBC execution finished signal received for query %s", queryId);
+            log.debug("JDBC execution finished signal received for query %s", queryId);
             buffer.jdbcFinished = true;
             buffer.checkAndSignalEos(queryId);
         }
+    }
+
+    /**
+     * PROACTIVE CLEANUP: Called when JDBC execution fails.
+     * This cleans up immediately instead of waiting for TTL-based cleanup.
+     * This prevents memory accumulation when queries fail before any data flows.
+     * 
+     * Only cleans up if there are no active consumers (PageSources) using the buffer.
+     * If there are consumers, they will clean up when they close.
+     */
+    public static void cleanupOnFailure(String queryId) {
+        QueryBuffer buffer = queryBuffers.get(queryId);
+        if (buffer == null) {
+            // Buffer was never created or already cleaned up
+            return;
+        }
+        
+        // Only clean up if no consumers are using this buffer
+        // If consumers exist, let them clean up via deregisterQuery on close()
+        if (buffer.activeConsumers.get() > 0) {
+            log.debug("Skipping immediate cleanup for query %s: %d active consumers will clean up on close", 
+                    queryId, buffer.activeConsumers.get());
+            return;
+        }
+        
+        // No consumers - proactively clean up now
+        log.warn("Proactive cleanup on failure for query %s (no active consumers)", queryId);
+        
+        // Force signal EOS in case anything is waiting
+        buffer.forceSignalEos(queryId);
+        
+        // Remove from all registries
+        queryBuffers.remove(queryId);
+        schemaRegistry.remove(queryId);
+        PerformanceProfiler.clear(queryId);
+        
+        // Clear the queue
+        buffer.queue.clear();
     }
     
     public static boolean hasBuffer(String queryId) {
@@ -225,7 +281,7 @@ public class DataBufferRegistry {
 
     public static void registerSchema(String queryId, List<Type> types) {
         schemaRegistry.put(queryId, types);
-        log.info("Registered schema types for query %s: %s", queryId, types);
+        log.debug("Registered schema types for query %s: %s", queryId, types);
     }
 
     public static List<Type> getSchema(String queryId) {
@@ -258,11 +314,19 @@ public class DataBufferRegistry {
     }
 
     public static void shutdown() {
-        log.info("Shutting down DataBufferRegistry...");
-        scheduler.shutdownNow();
+        log.debug("Shutting down DataBufferRegistry...");
+        eosScheduler.shutdownNow();
+        
+        // Clean up all remaining buffers
         for (String queryId : queryBuffers.keySet()) {
-            deregisterQuery(queryId);
+            QueryBuffer buffer = queryBuffers.get(queryId);
+            if (buffer != null) {
+                buffer.forceSignalEos(queryId);
+                buffer.queue.clear();
+            }
         }
         queryBuffers.clear();
+        schemaRegistry.clear();
+        log.debug("DataBufferRegistry shutdown complete. Cleared all buffers and schemas.");
     }
 }

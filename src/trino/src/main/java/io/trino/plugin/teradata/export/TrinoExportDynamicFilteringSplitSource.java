@@ -149,7 +149,9 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
                 ") AS export_result", 
                 config.getUdfDatabase(), config.getUdfName(), innerQuery, targetIps, splitId, token, config.getBatchSize(), config.isCompressionEnabled() ? 1 : 0);
 
-        log.info("Executing Teradata SQL for query %s: %s", splitId, teradataSql);
+        // SECURITY: Mask the security token in logged SQL
+        String logSql = teradataSql.replace(token.isEmpty() ? "\0" : token, "***MASKED***");
+        log.info("Executing Teradata SQL for query %s: %s", splitId, logSql);
 
         try (java.sql.Connection conn = getConnection();
              java.sql.Statement stmt = conn.createStatement();
@@ -158,6 +160,9 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
             log.info("Teradata SQL execution finished successfully for query %s", splitId);
         } catch (Exception e) {
             log.error(e, "Error executing Teradata SQL for query %s", splitId);
+            // PROACTIVE CLEANUP: Clean up immediately on failure instead of waiting for TTL
+            // This prevents memory accumulation when JDBC execution fails before any data flows
+            DataBufferRegistry.cleanupOnFailure(splitId);
         } finally {
             DataBufferRegistry.signalJdbcFinished(splitId);
             broadcastJdbcFinishedSignal();
