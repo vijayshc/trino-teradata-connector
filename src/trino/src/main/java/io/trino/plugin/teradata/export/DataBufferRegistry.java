@@ -114,19 +114,22 @@ public class DataBufferRegistry {
                     Thread.currentThread().interrupt();
                 }
             } else if (jdbcFinished && !hadAnyConnections) {
-                // Edge case: JDBC finished but no socket connections ever arrived
-                // This could happen for queries that return no data, or network issues
+                // Edge case: JDBC finished but no socket connections ever arrived on this worker.
+                // In multi-node setups, this is NORMAL for queries returning few records (e.g., max(date)).
+                // Since jdbcFinished is true, we know the query is complete - no more data will arrive.
+                // Only wait a short stabilization period (200ms) for any in-flight socket accepts.
                 long now = System.currentTimeMillis();
-                long timeSinceCreation = now - createdAt;
+                long timeSinceJdbcFinished = now - lastActivityTime;  // lastActivityTime updated on JDBC finished
                 
-                // Wait up to 5 seconds for connections, then give up
-                if (timeSinceCreation < 5000) {
-                    log.debug("EOS check deferred for query %s (waiting for connections, age: %d ms)", queryId, timeSinceCreation);
-                    eosScheduler.schedule(() -> checkAndSignalEos(queryId), 500, TimeUnit.MILLISECONDS);
+                // Short stabilization: 200ms is enough for any in-flight socket accepts
+                // The 5-second wait was causing unnecessary delay for workers that correctly received no data
+                if (timeSinceJdbcFinished < 200) {
+                    log.debug("EOS check deferred for query %s (short stabilization: %d ms)", queryId, timeSinceJdbcFinished);
+                    eosScheduler.schedule(() -> checkAndSignalEos(queryId), 100, TimeUnit.MILLISECONDS);
                     return;
                 }
                 
-                // No connections after 5 seconds - assume query returned no data
+                // JDBC finished and stabilization complete - signal EOS immediately
                 try {
                     // Push EOS markers for ALL consumers
                     int consumerCount = Math.max(1, activeConsumers.get());
@@ -134,7 +137,7 @@ public class DataBufferRegistry {
                         queue.put(BatchContainer.endOfStream());
                     }
                     eosSignaled = true;
-                    log.debug("Signaled end of stream for query %s (no connections received, pushed %d EOS markers)", 
+                    log.debug("Signaled end of stream for query %s (no data for this worker, pushed %d EOS markers)", 
                             queryId, consumerCount);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -284,6 +287,7 @@ public class DataBufferRegistry {
         if (buffer != null) {
             log.debug("JDBC execution finished signal received for query %s", queryId);
             buffer.jdbcFinished = true;
+            buffer.updateActivity();  // Update timestamp so stabilization timing is accurate
             buffer.checkAndSignalEos(queryId);
         }
     }
