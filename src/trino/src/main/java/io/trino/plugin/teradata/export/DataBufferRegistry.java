@@ -32,6 +32,9 @@ public class DataBufferRegistry {
     private static final Map<String, QueryBuffer> queryBuffers = new ConcurrentHashMap<>();
     private static final Map<String, List<Type>> schemaRegistry = new ConcurrentHashMap<>();
     
+    // Dynamic per-query token storage for security
+    private static final Map<String, String> dynamicTokenRegistry = new ConcurrentHashMap<>();
+    
     // Scheduler for short-lived EOS timing checks only (ms-scale delays, not TTL cleanup)
     private static final ScheduledExecutorService eosScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "data-buffer-eos-scheduler");
@@ -172,8 +175,9 @@ public class DataBufferRegistry {
             }
             
             queryBuffers.remove(queryId);
-            // Also clean up schema registry and performance profiler entries
+            // Also clean up schema registry, token registry, and performance profiler entries
             schemaRegistry.remove(queryId);
+            dynamicTokenRegistry.remove(queryId);
             PerformanceProfiler.clear(queryId);
             
             log.debug("Deregistered buffer, schema, and profiler for query %s. All consumers closed.", queryId);
@@ -269,6 +273,7 @@ public class DataBufferRegistry {
         // Remove from all registries
         queryBuffers.remove(queryId);
         schemaRegistry.remove(queryId);
+        dynamicTokenRegistry.remove(queryId);
         PerformanceProfiler.clear(queryId);
         
         // Clear the queue
@@ -313,6 +318,46 @@ public class DataBufferRegistry {
         }
     }
 
+    /**
+     * Register a dynamic token for a query.
+     * This token is generated per-query and used for socket authentication.
+     */
+    public static void registerDynamicToken(String queryId, String token) {
+        dynamicTokenRegistry.put(queryId, token);
+        log.debug("Registered dynamic token for query %s", queryId);
+    }
+
+    /**
+     * Validate a dynamic token for a query.
+     * @return true if the token matches the registered token for this query
+     */
+    public static boolean validateDynamicToken(String queryId, String receivedToken) {
+        String expectedToken = dynamicTokenRegistry.get(queryId);
+        if (expectedToken == null) {
+            log.warn("No dynamic token registered for query %s", queryId);
+            return false;
+        }
+        boolean valid = expectedToken.equals(receivedToken);
+        if (!valid) {
+            log.error("Invalid dynamic token for query %s", queryId);
+        }
+        return valid;
+    }
+
+    /**
+     * Get the dynamic token for a query.
+     */
+    public static String getDynamicToken(String queryId) {
+        return dynamicTokenRegistry.get(queryId);
+    }
+
+    /**
+     * Check if a dynamic token is registered for a query.
+     */
+    public static boolean hasDynamicToken(String queryId) {
+        return dynamicTokenRegistry.containsKey(queryId);
+    }
+
     public static void shutdown() {
         log.debug("Shutting down DataBufferRegistry...");
         eosScheduler.shutdownNow();
@@ -327,6 +372,7 @@ public class DataBufferRegistry {
         }
         queryBuffers.clear();
         schemaRegistry.clear();
-        log.debug("DataBufferRegistry shutdown complete. Cleared all buffers and schemas.");
+        dynamicTokenRegistry.clear();
+        log.debug("DataBufferRegistry shutdown complete. Cleared all buffers, schemas, and tokens.");
     }
 }

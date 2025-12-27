@@ -108,26 +108,22 @@ public class TeradataBridgeServer implements AutoCloseable {
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), inputBufferSize));
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             
-            // 1. Security Token Validation
-            if (config.getSecurityToken() != null && !config.getSecurityToken().isEmpty()) {
-                int tokenLen = in.readInt();
-                byte[] tokenBytes = new byte[tokenLen];
-                in.readFully(tokenBytes);
-                String receivedToken = new String(tokenBytes, StandardCharsets.UTF_8);
-                
-                if (!config.getSecurityToken().equals(receivedToken)) {
-                    log.error("Invalid security token from %s", socket.getRemoteSocketAddress());
-                    out.write("ERROR: UNAUTHORIZED".getBytes(StandardCharsets.UTF_8));
-                    out.flush();
-                    return;
-                }
+            // 1. Mandatory Dynamic Token Validation
+            // Protocol: [tokenLen (int)][token (string)][queryIdLen/Magic (int)][queryId (string)]...
+            int tokenLen = in.readInt();
+            if (tokenLen <= 0 || tokenLen > 1024) {
+                log.error("Invalid token length: %d from %s", tokenLen, socket.getRemoteSocketAddress());
+                return;
             }
+            byte[] tokenBytes = new byte[tokenLen];
+            in.readFully(tokenBytes);
+            String receivedToken = new String(tokenBytes, StandardCharsets.UTF_8);
             
             // 2. Read Magic Number or Query ID Length
             int lenOrMagic = in.readInt();
             
             if (lenOrMagic == CONTROL_MAGIC) {
-                handleControlMessage(in, out);
+                handleControlMessage(in, out, receivedToken);
                 return;
             }
             
@@ -135,7 +131,16 @@ public class TeradataBridgeServer implements AutoCloseable {
             byte[] queryIdBytes = new byte[lenOrMagic];
             in.readFully(queryIdBytes);
             queryId = new String(queryIdBytes, StandardCharsets.UTF_8);
-            log.info("Receiving data for query: %s", queryId);
+            
+            // Now we have both QueryId and Token - Validate it
+            if (!DataBufferRegistry.validateDynamicToken(queryId, receivedToken)) {
+                log.error("Unauthorized: Invalid dynamic token for query %s from %s", queryId, socket.getRemoteSocketAddress());
+                out.write("ERROR: UNAUTHORIZED".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                return;
+            }
+
+            log.info("Receiving data for authenticated query: %s", queryId);
 
             // Register this connection FIRST (before any data processing)
             DataBufferRegistry.incrementConnections(queryId);
@@ -271,7 +276,7 @@ public class TeradataBridgeServer implements AutoCloseable {
         }
     }
 
-    private void handleControlMessage(DataInputStream in, DataOutputStream out) throws IOException {
+    private void handleControlMessage(DataInputStream in, DataOutputStream out, String receivedToken) throws IOException {
         String queryId = "unknown";
         try {
             int qidLen = in.readInt();
@@ -279,9 +284,15 @@ public class TeradataBridgeServer implements AutoCloseable {
             in.readFully(qidBytes);
             queryId = new String(qidBytes, StandardCharsets.UTF_8);
             
+            // Validate Token for Control Message
+            if (!DataBufferRegistry.validateDynamicToken(queryId, receivedToken)) {
+                log.error("Unauthorized control message: Invalid dynamic token for query %s", queryId);
+                return;
+            }
+            
             int command = in.readInt();
             if (command == 1) { // 1 = JDBC_FINISHED
-                log.info("Received Global EOS signal for query %s", queryId);
+                log.info("Received Authenticated Global EOS signal for query %s", queryId);
                 DataBufferRegistry.signalJdbcFinished(queryId);
             }
             

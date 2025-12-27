@@ -9,6 +9,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -141,16 +142,19 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
         String innerQuery = "SELECT" + topClause + " " + columnList + " FROM " + schemaTable + 
                            whereClause + groupByClause + orderByClause + sampleClause;
         
-        String token = config.getSecurityToken() != null ? config.getSecurityToken() : "";
+        // SECURITY: Generate a random, per-query token to replace the static token in query logs.
+        String dynamicToken = UUID.randomUUID().toString();
+        DataBufferRegistry.registerDynamicToken(splitId, dynamicToken);
+        
         String teradataSql = String.format(
                 "SELECT * FROM %s.%s(" +
                 "  ON (%s)" +
                 "   ON (SELECT CAST('%s' AS VARCHAR(2048)) as target_ips, CAST('%s' AS VARCHAR(256)) as qid, CAST('%s' AS VARCHAR(256)) as token, CAST(%d AS INTEGER) as batch_size, CAST(%d AS INTEGER) as compression_enabled) DIMENSION" +
                 ") AS export_result", 
-                config.getUdfDatabase(), config.getUdfName(), innerQuery, targetIps, splitId, token, config.getBatchSize(), config.isCompressionEnabled() ? 1 : 0);
+                config.getUdfDatabase(), config.getUdfName(), innerQuery, targetIps, splitId, dynamicToken, config.getBatchSize(), config.isCompressionEnabled() ? 1 : 0);
 
-        // SECURITY: Mask the security token in logged SQL
-        String logSql = teradataSql.replace(token.isEmpty() ? "\0" : token, "***MASKED***");
+        // SECURITY: Mask the dynamic token in logged SQL
+        String logSql = teradataSql.replace(dynamicToken, "***DYNAMIC_TOKEN***");
         log.info("Executing Teradata SQL for query %s: %s", splitId, logSql);
 
         try (java.sql.Connection conn = getConnection();
@@ -188,9 +192,10 @@ public class TrinoExportDynamicFilteringSplitSource implements ConnectorSplitSou
                     
                     socket.setSoTimeout(5000);
                     
-                    // 1. Token (if enabled)
-                    if (config.getSecurityToken() != null && !config.getSecurityToken().isEmpty()) {
-                        byte[] tokenBytes = config.getSecurityToken().getBytes(StandardCharsets.UTF_8);
+                    // 1. Dynamic Token
+                    String dynamicToken = DataBufferRegistry.getDynamicToken(splitId);
+                    if (dynamicToken != null) {
+                        byte[] tokenBytes = dynamicToken.getBytes(StandardCharsets.UTF_8);
                         out.writeInt(tokenBytes.length);
                         out.write(tokenBytes);
                     }

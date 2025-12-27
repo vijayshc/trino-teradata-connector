@@ -37,9 +37,6 @@ public class TrinoExportConfig {
     private boolean enableAggregationPushdown = true;
     private boolean enableTopNPushdown = true;
 
-    // === Security Settings ===
-    private String securityToken;
-    private String tokenScript;
     private boolean enforceProxyAuthentication = true;
 
     // === UDF Settings ===
@@ -285,30 +282,6 @@ public class TrinoExportConfig {
     // ============================================================
     // Security Getters/Setters
     // ============================================================
-
-    @Config("teradata.export.token")
-    @ConfigSecuritySensitive
-    public TrinoExportConfig setSecurityToken(String securityToken) {
-        this.securityToken = securityToken;
-        return this;
-    }
-
-    @Config("teradata.export.token-script")
-    public TrinoExportConfig setTokenScript(String tokenScript) {
-        this.tokenScript = tokenScript;
-        return this;
-    }
-
-    public String getTokenScript() {
-        return tokenScript;
-    }
-
-    public String getSecurityToken() {
-        if (tokenScript != null && !tokenScript.isEmpty()) {
-            return executeScript(tokenScript);
-        }
-        return securityToken;
-    }
 
     public boolean isEnforceProxyAuthentication() {
         return enforceProxyAuthentication;
